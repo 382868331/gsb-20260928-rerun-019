@@ -7,7 +7,13 @@ import sys
 import pytest
 
 from terrain_system.cli import main
-from terrain_system.edits import EditOp, RoadEditOp, next_edit_id
+from terrain_system.edits import (
+    EditOp,
+    JunctionAdjustmentOp,
+    LinearWorkOp,
+    apply_edits,
+    next_edit_id,
+)
 from terrain_system.model import ChunkKey, generate_grid
 from terrain_system.parameters import ParameterError, TerrainParameters
 from terrain_system.project import create_project, load_project
@@ -103,8 +109,9 @@ def test_road_crosses_chunk_boundary_and_survives_regeneration(tmp_path: Path):
     project = create_project(tmp_path, params())
     project.generate_chunks([ChunkKey(0, 0), ChunkKey(1, 0)])
 
-    road = RoadEditOp(
+    road = LinearWorkOp(
         id=1,
+        kind="road",
         x1=-2.0,
         y1=0.0,
         x2=12.0,
@@ -127,22 +134,148 @@ def test_road_crosses_chunk_boundary_and_survives_regeneration(tmp_path: Path):
     assert reloaded.check_loaded_seams() == []
 
 
-def test_road_intersections_order_and_undo_are_deterministic(tmp_path: Path):
+def test_road_intersections_priority_and_undo_are_deterministic(tmp_path: Path):
     project = create_project(tmp_path, params())
     project.generate_chunks([ChunkKey(0, 0)])
-    first = RoadEditOp(1, -2.0, 0.0, 12.0, 0.0, 2.0, 4.0)
-    second = RoadEditOp(2, 0.0, -2.0, 0.0, 12.0, 2.0, 7.0)
+    first = LinearWorkOp(1, "road", -2.0, 0.0, 12.0, 0.0, 2.0, 4.0, priority=0)
+    second = LinearWorkOp(2, "road", 0.0, -2.0, 0.0, 12.0, 2.0, 7.0, priority=1)
     project.add_edit(first)
     project.add_edit(second)
 
     assert project.load_chunk(ChunkKey(0, 0))["heights"][0][0] == 7.0
-    assert project.undo_edit(1) == [ChunkKey(0, 0)]
+    result = project.undo_edit(1)
+    assert result["updated_chunks"] == [ChunkKey(0, 0)]
+    assert result["voided_edits"] == []
     assert project.load_chunk(ChunkKey(0, 0))["heights"][0][0] == 7.0
 
     reloaded = load_project(tmp_path)
-    assert reloaded.undo_edit(2) == [ChunkKey(0, 0)]
+    assert reloaded.undo_edit(2)["updated_chunks"] == [ChunkKey(0, 0)]
     final = reloaded.load_chunk(ChunkKey(0, 0))
     assert final["heights"] == final["base_heights"]
+
+
+def test_priority_not_last_edit_decides_overlap_and_order_is_stable(tmp_path: Path):
+    p = params()
+    road = LinearWorkOp(2, "road", -2.0, 0.0, 12.0, 0.0, 2.0, 4.0, priority=1)
+    river = LinearWorkOp(1, "river", 0.0, -2.0, 0.0, 12.0, 2.0, 7.0, priority=0)
+
+    heights_a = generate_grid(p, ChunkKey(0, 0), [road, river])["heights"]
+    heights_b = generate_grid(p, ChunkKey(0, 0), [river, road])["heights"]
+    assert heights_a == heights_b
+    assert heights_a[0][0] == 4.0
+    assert apply_edits(0.0, 0.0, 0.0, [road, river]) == 4.0
+
+
+def test_junction_revision_overrides_only_small_overlap_zone(tmp_path: Path):
+    project = create_project(tmp_path, params())
+    project.generate_chunks([ChunkKey(0, 0)])
+    road = LinearWorkOp(1, "road", -6.0, 0.0, 16.0, 0.0, 2.0, 4.0)
+    river = LinearWorkOp(2, "river", 0.0, -6.0, 0.0, 16.0, 2.0, 7.0, priority=1)
+    project.add_edit(road)
+    project.add_edit(river)
+    junction = JunctionAdjustmentOp(3, 1, 2, 0.0, 0.0, 1.5, 5.5)
+    affected = project.add_edit(junction)
+    assert affected == [ChunkKey(0, 0)]
+
+    chunk = project.load_chunk(ChunkKey(0, 0))
+    assert chunk["heights"][0][0] == 5.5
+    assert chunk["heights"][0][-1] == 4.0
+    assert chunk["heights"][-1][0] == 7.0
+
+    result = project.undo_edit(3)
+    assert result["voided_edits"] == []
+    reverted = project.load_chunk(ChunkKey(0, 0))
+    assert reverted["heights"][0][0] == 7.0
+    assert reverted["heights"][0][-1] == 4.0
+
+
+def test_removing_work_voids_junction_and_keeps_other_river(tmp_path: Path):
+    project = create_project(tmp_path, params())
+    project.generate_chunks([ChunkKey(0, 0)])
+    road = LinearWorkOp(1, "road", -6.0, 0.0, 16.0, 0.0, 2.0, 4.0)
+    river = LinearWorkOp(2, "river", 0.0, -6.0, 0.0, 16.0, 2.0, 7.0)
+    junction = JunctionAdjustmentOp(3, 1, 2, 0.0, 0.0, 1.5, 5.5)
+    project.add_edit(road)
+    project.add_edit(river)
+    project.add_edit(junction)
+
+    result = project.undo_edit(1)
+    assert [item["id"] for item in result["voided_edits"]] == [3]
+    assert all("road 1" in item["reason"] for item in result["voided_edits"])
+
+    chunk = project.load_chunk(ChunkKey(0, 0))
+    assert chunk["heights"][-1][0] == 7.0
+    assert project.load_chunk(ChunkKey(0, 0))["heights"][0][0] != 5.5
+
+    reloaded = load_project(tmp_path)
+    assert [edit.id for edit in reloaded.edits] == [2]
+    assert reloaded.voided_edits[-1]["id"] == 3
+
+
+def test_preview_reports_affected_chunks_and_intersection_retention(tmp_path: Path, capsys):
+    project = create_project(tmp_path, params())
+    project.generate_chunks([ChunkKey(-1, -1), ChunkKey(0, 0), ChunkKey(1, 0)])
+    road = LinearWorkOp(
+        next_edit_id(project.edits), "road", -12.0, 0.0, 12.0, 0.0, 2.0, 4.0, priority=1
+    )
+    project.add_edit(road)
+
+    assert main([
+        "preview", str(tmp_path),
+        "--kind", "river", "--x1", "0", "--y1", "-12",
+        "--x2", "0", "--y2", "12", "--width", "2", "--height", "7",
+        "--priority", "0",
+    ]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "preview"
+    assert payload["affected_chunks"] == [[-1, -1], [0, 0]]
+    assert payload["intersections"] == [{
+        "other_work": 1,
+        "other_kind": "road",
+        "point": [0.0, 0.0],
+        "retained_work": 1,
+        "overridden_work": 2,
+    }]
+    assert [edit.id for edit in load_project(tmp_path).edits] == [1]
+
+
+def test_negative_coordinate_determinism_across_order_and_reopen(tmp_path: Path):
+    project = create_project(tmp_path, params())
+    project.generate_chunks([ChunkKey(-1, -1), ChunkKey(0, 0)])
+    road = LinearWorkOp(1, "road", -12.0, -2.0, 8.0, -2.0, 2.0, 4.0, shoulder=2.0)
+    river = LinearWorkOp(2, "river", -2.0, -12.0, -2.0, 8.0, 2.0, 2.0, shoulder=2.0, priority=1)
+    project.add_edit(road)
+    project.add_edit(river)
+
+    direct = generate_grid(project.parameters, ChunkKey(-1, -1), list(reversed(project.edits)))
+    stored = project.load_chunk(ChunkKey(-1, -1))
+    assert direct["heights"] == stored["heights"]
+    assert project.check_loaded_seams() == []
+
+    reloaded = load_project(tmp_path)
+    reloaded.generate_chunks([ChunkKey(0, 0), ChunkKey(-1, -1)])
+    assert reloaded.check_loaded_seams() == []
+    assert reloaded.load_chunk(ChunkKey(-1, -1))["heights"] == stored["heights"]
+
+
+def test_cli_junction_and_river_undo_report(tmp_path: Path, capsys):
+    assert main(["init", str(tmp_path), "--seed", "7", "--chunk-size", "10", "--resolution", "5", "--scale", "20"]) == 0
+    assert main(["generate", str(tmp_path), "0,0"]) == 0
+    assert main(["road", str(tmp_path), "--x1", "-6", "--y1", "0", "--x2", "16", "--y2", "0", "--width", "2", "--height", "4"]) == 0
+    assert main(["river", str(tmp_path), "--x1", "0", "--y1", "-6", "--x2", "0", "--y2", "16", "--width", "2", "--height", "7", "--priority", "1"]) == 0
+    assert main(["junction", str(tmp_path), "--work-a", "1", "--work-b", "2", "--x", "0", "--y", "0", "--radius", "1.5", "--height", "5.5"]) == 0
+    assert main(["undo", str(tmp_path), "--id", "1"]) == 0
+
+    output_lines = capsys.readouterr().out.splitlines()
+    last_object = len(output_lines) - 1 - output_lines[::-1].index("{")
+    payload = json.loads("\n".join(output_lines[last_object:]))
+    assert payload["kind"] == "road"
+    assert payload["voided_edits"] == [{
+        "id": 3,
+        "reason": "referenced road 1 was removed",
+        "work_a": 1,
+        "work_b": 2,
+    }]
 
 
 def test_generation_is_consistent_across_processes_order_reopen_and_local_recompute(tmp_path: Path):

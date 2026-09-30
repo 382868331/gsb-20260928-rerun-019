@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .edits import EditOp, RoadEditOp, apply_edits
+from .edits import JunctionAdjustmentOp, LinearWorkOp, apply_edits
 from .noise import terrain_height
 from .parameters import TerrainParameters
 
@@ -56,7 +56,7 @@ def base_height_at(params: TerrainParameters, x: float, y: float) -> float:
     )
 
 
-def generate_grid(params: TerrainParameters, key: ChunkKey, edits: list[EditOp | RoadEditOp]) -> dict:
+def generate_grid(params: TerrainParameters, key: ChunkKey, edits: list) -> dict:
     validate_chunk_key(key)
     ordered_edits = sorted(edits, key=lambda edit: edit.id)
     base = []
@@ -94,13 +94,19 @@ def generate_grid(params: TerrainParameters, key: ChunkKey, edits: list[EditOp |
     }
 
 
-def chunk_affected_by_edit(params: TerrainParameters, key: ChunkKey, edit: EditOp | RoadEditOp) -> bool:
+def chunk_affected_by_edit(params: TerrainParameters, key: ChunkKey, edit) -> bool:
     min_x = key.x * params.chunk_size
     min_y = key.y * params.chunk_size
     max_x = min_x + params.chunk_size
     max_y = min_y + params.chunk_size
-    if isinstance(edit, RoadEditOp):
-        radius = edit.width / 2.0 + edit.shoulder
+    if isinstance(edit, (LinearWorkOp, JunctionAdjustmentOp)):
+        radius = edit.influence_radius()
+        if isinstance(edit, JunctionAdjustmentOp):
+            nearest_x = min(max(edit.x, min_x), max_x)
+            nearest_y = min(max(edit.y, min_y), max_y)
+            dx = edit.x - nearest_x
+            dy = edit.y - nearest_y
+            return dx * dx + dy * dy < radius * radius
         return _segment_meets_expanded_rectangle(
             edit.x1, edit.y1, edit.x2, edit.y2, min_x, min_y, max_x, max_y, radius
         )

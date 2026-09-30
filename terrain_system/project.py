@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from .edits import EditOp, RoadEditOp, edit_from_dict, next_edit_id
+from .edits import (
+    JunctionAdjustmentOp,
+    LinearWorkOp,
+    edit_from_dict,
+    next_edit_id,
+)
 from .model import ChunkKey, chunk_affected_by_edit, generate_grid, validate_chunk_key
 from .parameters import ParameterError, TerrainParameters
 from .stitch import check_seams
@@ -13,6 +19,21 @@ from .stitch import check_seams
 
 PROJECT_FILE = "project.json"
 CHUNK_DIR = "chunks"
+
+
+def segment_intersection(
+    x1: float, y1: float, x2: float, y2: float,
+    x3: float, y3: float, x4: float, y4: float,
+) -> tuple[float, float] | None:
+    denominator = (x1 - x2) * (y3 - y4) - (y1 - y2) * (x3 - x4)
+    if denominator == 0.0:
+        return None
+    px = ((x1 * y2 - y1 * x2) * (x3 - x4) - (x1 - x2) * (x3 * y4 - y3 * x4)) / denominator
+    py = ((x1 * y2 - y1 * x2) * (y3 - y4) - (y1 - y2) * (x3 * y4 - y3 * x4)) / denominator
+    if min(x1, x2) - 1e-9 <= px <= max(x1, x2) + 1e-9 and min(y1, y2) - 1e-9 <= py <= max(y1, y2) + 1e-9:
+        if min(x3, x4) - 1e-9 <= px <= max(x3, x4) + 1e-9 and min(y3, y4) - 1e-9 <= py <= max(y3, y4) + 1e-9:
+            return px, py
+    return None
 
 
 class ProjectError(RuntimeError):
@@ -48,11 +69,19 @@ def _read_json(path: Path) -> dict:
 
 
 class TerrainProject:
-    def __init__(self, root: Path, parameters: TerrainParameters, edits: list[EditOp | RoadEditOp], chunks: dict[str, str]):
+    def __init__(
+        self,
+        root: Path,
+        parameters: TerrainParameters,
+        edits: list,
+        chunks: dict[str, str],
+        voided_edits: list[dict] | None = None,
+    ):
         self.root = root
         self.parameters = parameters
         self.edits = sorted(edits, key=lambda edit: edit.id)
         self.chunks = dict(chunks)
+        self.voided_edits = list(voided_edits or [])
 
     @property
     def chunk_dir(self) -> Path:
@@ -64,7 +93,11 @@ class TerrainProject:
             "parameters": self.parameters.to_dict(),
             "edits": [edit.to_dict() for edit in self.edits],
             "chunks": dict(sorted(self.chunks.items())),
+            "voided_edits": list(self.voided_edits),
         }
+
+    def linear_works(self) -> list[LinearWorkOp]:
+        return [edit for edit in self.edits if isinstance(edit, LinearWorkOp)]
 
     def save_manifest(self) -> None:
         _atomic_write(self.root / PROJECT_FILE, self.to_dict())
@@ -106,10 +139,20 @@ class TerrainProject:
             loaded[(key.x, key.y)] = data
         return loaded
 
-    def add_edit(self, edit: EditOp | RoadEditOp) -> list[ChunkKey]:
+    def _validate_junction_references(self, edit) -> None:
+        work_ids = {work.id for work in self.linear_works()}
+        missing = [ref for ref in (edit.work_a, edit.work_b) if ref not in work_ids]
+        if missing:
+            raise ProjectError(
+                "junction references missing work(s): " + ", ".join(str(value) for value in missing)
+            )
+
+    def add_edit(self, edit) -> list[ChunkKey]:
         edit.validate()
         if edit.id <= 0 or edit.id in {stored.id for stored in self.edits}:
             raise EditError("edit id must be the next sequential id")
+        if isinstance(edit, JunctionAdjustmentOp):
+            self._validate_junction_references(edit)
         self.edits.append(edit)
 
         affected = []
@@ -124,22 +167,90 @@ class TerrainProject:
         self.save_manifest()
         return affected
 
-    def undo_edit(self, edit_id: int) -> list[ChunkKey]:
+    def _affected_stored_chunks(self, edit) -> list[ChunkKey]:
+        return [
+            ChunkKey.parse(stored_key)
+            for stored_key in sorted(self.chunks)
+            if chunk_affected_by_edit(self.parameters, ChunkKey.parse(stored_key), edit)
+        ]
+
+    def undo_edit(self, edit_id: int) -> dict:
         removed = next((edit for edit in self.edits if edit.id == edit_id), None)
         if removed is None:
             raise EditError(f"edit not found: {edit_id}")
 
-        affected = [
-            ChunkKey.parse(stored_key)
-            for stored_key in sorted(self.chunks)
-            if chunk_affected_by_edit(self.parameters, ChunkKey.parse(stored_key), removed)
-        ]
-        self.edits = [edit for edit in self.edits if edit.id != edit_id]
+        affected_set = set(self._affected_stored_chunks(removed))
+        voided = []
+        if isinstance(removed, LinearWorkOp):
+            dependents = [
+                edit
+                for edit in self.edits
+                if isinstance(edit, JunctionAdjustmentOp)
+                and removed.id in (edit.work_a, edit.work_b)
+            ]
+            for junction in dependents:
+                voided.append({
+                    "id": junction.id,
+                    "reason": f"referenced {removed.kind} {removed.id} was removed",
+                    "work_a": junction.work_a,
+                    "work_b": junction.work_b,
+                })
+                affected_set.update(self._affected_stored_chunks(junction))
+            voided_ids = {item["id"] for item in voided}
+            self.voided_edits.extend(voided)
+            self.edits = [
+                edit
+                for edit in self.edits
+                if edit.id != edit_id and edit.id not in voided_ids
+            ]
+        else:
+            self.edits = [edit for edit in self.edits if edit.id != edit_id]
+        affected = sorted(affected_set, key=lambda key: (key.x, key.y))
         for key in affected:
             grid = generate_grid(self.parameters, key, self.edits)
             _atomic_write(self.chunk_dir / key.filename, grid)
         self.save_manifest()
-        return affected
+        return {
+            "removed": removed,
+            "updated_chunks": affected,
+            "voided_edits": voided,
+        }
+
+    def revision_summary(self, edit: LinearWorkOp) -> dict:
+        affected = [
+            ChunkKey.parse(stored_key)
+            for stored_key in sorted(self.chunks)
+            if chunk_affected_by_edit(self.parameters, ChunkKey.parse(stored_key), edit)
+        ]
+        relations = []
+        for other in self.linear_works():
+            point = segment_intersection(
+                edit.x1, edit.y1, edit.x2, edit.y2,
+                other.x1, other.y1, other.x2, other.y2,
+            )
+            if point is None:
+                continue
+            x, y = point
+            if edit.distance_to_segment(x, y) <= edit.influence_radius() and other.distance_to_segment(
+                x, y
+            ) <= other.influence_radius():
+                edit_rank = (edit.priority, -edit.id)
+                other_rank = (other.priority, -other.id)
+                winner, loser = (edit, other) if edit_rank >= other_rank else (other, edit)
+                relations.append({
+                    "other_work": other.id,
+                    "other_kind": other.kind,
+                    "point": [x, y],
+                    "retained_work": winner.id,
+                    "overridden_work": loser.id,
+                })
+        return {
+            "edit_id": edit.id,
+            "kind": edit.kind,
+            "priority": edit.priority,
+            "affected_chunks": [[key.x, key.y] for key in affected],
+            "intersections": relations,
+        }
 
     def check_loaded_seams(self, tolerance: float = 0.0):
         return check_seams(self.load_all_chunks(), tolerance=tolerance)
@@ -163,19 +274,38 @@ def load_project(root: Path) -> TerrainProject:
     data = _read_json(manifest)
     if data.get("version") != 1:
         raise ProjectError("unsupported project version")
+    raw_edits = data.get("edits", [])
+    raw_chunks = data.get("chunks", {})
+    raw_voided = data.get("voided_edits", [])
     try:
         parameters = TerrainParameters.from_mapping(data["parameters"])
-        raw_edits = data.get("edits", [])
-        raw_chunks = data.get("chunks", {})
     except (ParameterError, KeyError, TypeError) as exc:
         raise ProjectError("invalid project manifest: " + str(exc)) from exc
 
-    if not isinstance(raw_edits, list) or not isinstance(raw_chunks, dict):
+    if not isinstance(raw_edits, list) or not isinstance(raw_chunks, dict) or not isinstance(raw_voided, list):
         raise ProjectError("invalid project manifest")
     edits = [edit_from_dict(value) for value in raw_edits]
     edit_ids = [edit.id for edit in edits]
     if len(edit_ids) != len(set(edit_ids)) or any(edit_id < 1 for edit_id in edit_ids):
         raise ProjectError("edit ids must be unique positive integers")
+
+    work_ids = {edit.id for edit in edits if isinstance(edit, LinearWorkOp)}
+    dangling = []
+    surviving = []
+    for edit in edits:
+        if isinstance(edit, JunctionAdjustmentOp) and (
+            edit.work_a not in work_ids or edit.work_b not in work_ids
+        ):
+            dangling.append({
+                "id": edit.id,
+                "reason": "junction referenced a missing work when project was reopened",
+                "work_a": edit.work_a,
+                "work_b": edit.work_b,
+            })
+        else:
+            surviving.append(edit)
+    edits = surviving
+    raw_voided = [*raw_voided, *dangling]
 
     chunks = {}
     for key, path in raw_chunks.items():
@@ -187,4 +317,7 @@ def load_project(root: Path) -> TerrainProject:
             raise ProjectError("missing chunk file: " + path)
         chunks[key] = path
 
-    return TerrainProject(root, parameters, edits, chunks)
+    if not all(isinstance(item, dict) for item in raw_voided):
+        raise ProjectError("invalid voided edit records")
+
+    return TerrainProject(root, parameters, edits, chunks, raw_voided)

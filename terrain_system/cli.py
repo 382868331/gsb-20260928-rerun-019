@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .edits import EditError, EditOp, RoadEditOp, next_edit_id
+from .edits import EditError, EditOp, JunctionAdjustmentOp, LinearWorkOp, next_edit_id
 from .model import ChunkKey
 from .parameters import ParameterError, TerrainParameters
 from .project import ProjectError, create_project, load_project
@@ -68,15 +68,42 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument("--delta", type=float, required=True, help="positive raises; negative lowers")
     edit.add_argument("--falloff", type=_positive_float, default=2.0)
 
-    road = subparsers.add_parser("road", help="flatten and smooth a road segment")
-    road.add_argument("project", type=Path)
-    road.add_argument("--x1", type=float, required=True)
-    road.add_argument("--y1", type=float, required=True)
-    road.add_argument("--x2", type=float, required=True)
-    road.add_argument("--y2", type=float, required=True)
-    road.add_argument("--width", type=_positive_float, required=True)
-    road.add_argument("--height", type=float, required=True)
-    road.add_argument("--shoulder", type=_non_negative_float, default=0.0)
+    def add_work_parser(name: str, help_text: str) -> None:
+        work = subparsers.add_parser(name, help=help_text)
+        work.add_argument("project", type=Path)
+        work.add_argument("--x1", type=float, required=True)
+        work.add_argument("--y1", type=float, required=True)
+        work.add_argument("--x2", type=float, required=True)
+        work.add_argument("--y2", type=float, required=True)
+        work.add_argument("--width", type=_positive_float, required=True)
+        work.add_argument("--height", type=float, required=True)
+        work.add_argument("--shoulder", type=_non_negative_float, default=0.0)
+        work.add_argument("--priority", type=int, default=0, help="higher priority is retained at intersections")
+
+    add_work_parser("road", "flatten and smooth a road segment")
+    add_work_parser("river", "cut and smooth a river channel segment")
+
+    junction = subparsers.add_parser("junction", help="add an independent revision for one road/river overlap")
+    junction.add_argument("project", type=Path)
+    junction.add_argument("--work-a", type=int, required=True)
+    junction.add_argument("--work-b", type=int, required=True)
+    junction.add_argument("--x", type=float, required=True)
+    junction.add_argument("--y", type=float, required=True)
+    junction.add_argument("--radius", type=_positive_float, required=True)
+    junction.add_argument("--height", type=float, required=True)
+    junction.add_argument("--feather", type=_non_negative_float, default=0.0)
+
+    preview = subparsers.add_parser("preview", help="preview a linear work without saving it")
+    preview.add_argument("project", type=Path)
+    preview.add_argument("--kind", choices=("road", "river"), required=True)
+    preview.add_argument("--x1", type=float, required=True)
+    preview.add_argument("--y1", type=float, required=True)
+    preview.add_argument("--x2", type=float, required=True)
+    preview.add_argument("--y2", type=float, required=True)
+    preview.add_argument("--width", type=_positive_float, required=True)
+    preview.add_argument("--height", type=float, required=True)
+    preview.add_argument("--shoulder", type=_non_negative_float, default=0.0)
+    preview.add_argument("--priority", type=int, default=0)
 
     undo = subparsers.add_parser("undo", help="remove one persistent edit and replay the rest")
     undo.add_argument("project", type=Path)
@@ -136,9 +163,10 @@ def main(argv: list[str] | None = None) -> int:
                 "edit_id": edit.id,
                 "updated_chunks": [[key.x, key.y] for key in affected],
             })
-        elif args.command == "road":
-            edit = RoadEditOp(
+        elif args.command in ("road", "river"):
+            edit = LinearWorkOp(
                 id=next_edit_id(project.edits),
+                kind=args.command,
                 x1=args.x1,
                 y1=args.y1,
                 x2=args.x2,
@@ -146,23 +174,61 @@ def main(argv: list[str] | None = None) -> int:
                 width=args.width,
                 height=args.height,
                 shoulder=args.shoulder,
+                priority=args.priority,
             )
             affected = project.add_edit(edit)
             _print_json({
                 "status": "edited",
                 "edit_id": edit.id,
-                "kind": "road",
+                "kind": edit.kind,
+                "priority": edit.priority,
                 "updated_chunks": [[key.x, key.y] for key in affected],
             })
+        elif args.command == "junction":
+            edit = JunctionAdjustmentOp(
+                id=next_edit_id(project.edits),
+                work_a=args.work_a,
+                work_b=args.work_b,
+                x=args.x,
+                y=args.y,
+                radius=args.radius,
+                height=args.height,
+                feather=args.feather,
+            )
+            affected = project.add_edit(edit)
+            _print_json({
+                "status": "edited",
+                "edit_id": edit.id,
+                "kind": "junction",
+                "works": sorted((edit.work_a, edit.work_b)),
+                "updated_chunks": [[key.x, key.y] for key in affected],
+            })
+        elif args.command == "preview":
+            candidate = LinearWorkOp(
+                id=next_edit_id(project.edits),
+                kind=args.kind,
+                x1=args.x1,
+                y1=args.y1,
+                x2=args.x2,
+                y2=args.y2,
+                width=args.width,
+                height=args.height,
+                shoulder=args.shoulder,
+                priority=args.priority,
+            )
+            candidate.validate()
+            _print_json({"status": "preview", **project.revision_summary(candidate)})
         elif args.command == "undo":
             edit_id = args.id if args.id is not None else max((edit.id for edit in project.edits), default=0)
             if edit_id < 1:
                 raise EditError("there are no edits to undo")
-            affected = project.undo_edit(edit_id)
+            result = project.undo_edit(edit_id)
             _print_json({
                 "status": "undone",
                 "edit_id": edit_id,
-                "updated_chunks": [[key.x, key.y] for key in affected],
+                "kind": result["removed"].type_name,
+                "updated_chunks": [[key.x, key.y] for key in result["updated_chunks"]],
+                "voided_edits": result["voided_edits"],
             })
         elif args.command == "stitch":
             loaded_chunks = project.load_all_chunks()
