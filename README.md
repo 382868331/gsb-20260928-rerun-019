@@ -29,11 +29,22 @@ python -m terrain_system.cli road ./terrain_demo --x1 -50 --y1 50 --x2 250 --y2 
 python -m terrain_system.cli generate ./terrain_demo 2,0
 python -m terrain_system.cli stitch ./terrain_demo
 python -m terrain_system.cli undo ./terrain_demo --id 2
+python -m terrain_system.cli river ./terrain_demo --x1 -50 --y1 -50 --x2 250 --y2 50 --width 8 --height -6 --priority 2
+python -m terrain_system.cli crossing ./terrain_demo --work-a 2 --work-b 3 --height 2 --radius 6
+python -m terrain_system.cli road ./terrain_demo --x1 0 --y1 0 --x2 200 --y2 0 --width 12 --height 8 --preview
 ~~~
 
 edit --delta 为正是抬高，为负是压低。road 把道路中心线半宽内压到指定绝对高度，并在 shoulder 宽度内用平滑坡面过渡到原地形；道路可穿过分块边界，函数只依赖世界坐标，因此两侧边界高度一致。编辑只记录一次，覆盖到的已生成块会立即更新；以后补生成的块也会自动应用同一编辑，不需要烘焙成随机地形的一部分。
 
-道路交叉处始终由较大的编辑 ID 决定后一次压平结果，因此编辑按 ID 顺序重放，而不受分块生成顺序或进程影响。undo --id 会移除指定编辑并重放其余编辑；省略 --id 时撤回最近一次编辑。撤回后再添加操作会使用新的最大 ID，旧 ID 不会被复用。
+## 道路、河道与交汇
+
+道路（road）和河道（river）都是独立的线状工程修订，各有自己的宽度、过渡肩和高度影响范围。交汇时不再由“最后一次编辑”无条件覆盖：priority 较大的工程保留自己的设计；priority 相同时保留较早（ID 较小）的修订。添加工程时返回 crossings 列表，逐项给出交点、保留方 kept、被覆盖方 overridden 和判定规则，重开工程或改变生成顺序都得到同一结果。
+
+需要时可以用 crossing 为一小段交汇区单独给出绝对高度调整，它通过 --work-a/--work-b 引用两条工程，只在交点周围 --radius 范围内平滑生效，优先级高于自动判定的保留方。引用的工程不存在或几何上不相交会被拒绝，工程不会落盘。
+
+road、river、crossing 都支持 --preview：只返回受影响分块 affected_chunks 和交汇关系，不写入任何文件。
+
+undo --id 只撤回这次修订并重放其余编辑，其他工程的修改仍在；省略 --id 时撤回最近一次编辑。撤回后再添加操作会使用新的最大 ID，旧 ID 不会被复用。若移除某条道路或河道导致 crossing 失去引用，该交汇调整不会被静默删除：它保留在工程中并标记为 state=invalidated，undo 输出 invalidated_crossings 说明原因（如 work 1 was removed），地形回到剩余工程的设计；被失效的 crossing 也可以再用 undo 明确移除。
 
 ## 持久化和非法参数
 
@@ -45,4 +56,4 @@ edit --delta 为正是抬高，为负是压低。road 把道路中心线半宽�
 python -m pytest
 ~~~
 
-测试覆盖不同分块生成次序、独立子进程和重开工程后的逐文件一致性、局部重算后的编辑保留、跨分块道路边界零裂缝、道路交叉顺序、撤回单次编辑、非法参数保留旧工程，以及完整 CLI 流程。
+测试覆盖不同分块生成次序、独立子进程和重开工程后的逐文件一致性（含负坐标分块）、局部重算后的编辑保留、跨分块道路边界零裂缝、道路/河道交汇的优先级与同优先级保留规则、交汇段人工调整、预览不落盘、撤回单次修订、交汇调整随工程移除而失效并给出说明、非法参数保留旧工程，以及完整 CLI 流程。

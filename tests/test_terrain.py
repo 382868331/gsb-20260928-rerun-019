@@ -7,7 +7,15 @@ import sys
 import pytest
 
 from terrain_system.cli import main
-from terrain_system.edits import EditOp, RoadEditOp, next_edit_id
+from terrain_system.edits import (
+    CrossingEditOp,
+    EditError,
+    EditOp,
+    LinearWorkOp,
+    RoadEditOp,
+    RiverEditOp,
+    next_edit_id,
+)
 from terrain_system.model import ChunkKey, generate_grid
 from terrain_system.parameters import ParameterError, TerrainParameters
 from terrain_system.project import create_project, load_project
@@ -127,22 +135,148 @@ def test_road_crosses_chunk_boundary_and_survives_regeneration(tmp_path: Path):
     assert reloaded.check_loaded_seams() == []
 
 
-def test_road_intersections_order_and_undo_are_deterministic(tmp_path: Path):
+def test_road_intersections_keep_explicit_priority_not_last_edit(tmp_path: Path):
     project = create_project(tmp_path, params())
     project.generate_chunks([ChunkKey(0, 0)])
-    first = RoadEditOp(1, -2.0, 0.0, 12.0, 0.0, 2.0, 4.0)
-    second = RoadEditOp(2, 0.0, -2.0, 0.0, 12.0, 2.0, 7.0)
+    first = LinearWorkOp(1, "road", -2.0, 0.0, 12.0, 0.0, 2.0, 4.0, priority=1.0)
+    second = LinearWorkOp(2, "river", 0.0, -2.0, 0.0, 12.0, 2.0, 7.0, priority=0.0)
     project.add_edit(first)
-    project.add_edit(second)
 
-    assert project.load_chunk(ChunkKey(0, 0))["heights"][0][0] == 7.0
-    assert project.undo_edit(1) == [ChunkKey(0, 0)]
+    _, relations = project.add_edit_report(second)
+    assert relations == [
+        {
+            "work_a": 1,
+            "work_b": 2,
+            "point": [0.0, 0.0],
+            "kept": 1,
+            "overridden": 2,
+            "rule": "higher priority; earlier id breaks ties",
+        }
+    ]
+    assert project.load_chunk(ChunkKey(0, 0))["heights"][0][0] == 4.0
+
+    affected, invalidated = project.undo_edit(1)
+    assert affected == [ChunkKey(0, 0)]
+    assert invalidated == []
     assert project.load_chunk(ChunkKey(0, 0))["heights"][0][0] == 7.0
 
     reloaded = load_project(tmp_path)
-    assert reloaded.undo_edit(2) == [ChunkKey(0, 0)]
+    affected, _ = reloaded.undo_edit(2)
+    assert affected == [ChunkKey(0, 0)]
     final = reloaded.load_chunk(ChunkKey(0, 0))
     assert final["heights"] == final["base_heights"]
+
+
+def test_equal_priority_resolves_to_earlier_revision_independent_of_add_order(tmp_path: Path):
+    project = create_project(tmp_path, params())
+    project.generate_chunks([ChunkKey(0, 0)])
+    low = LinearWorkOp(1, "road", 0.0, -2.0, 0.0, 12.0, 2.0, 7.0)
+    high = LinearWorkOp(2, "road", -2.0, 0.0, 12.0, 0.0, 2.0, 4.0)
+    project.add_edit(low)
+    project.add_edit(high)
+    assert project.load_chunk(ChunkKey(0, 0))["heights"][0][0] == 7.0
+
+    reloaded = load_project(tmp_path)
+    assert reloaded.load_chunk(ChunkKey(0, 0))["heights"][0][0] == 7.0
+
+
+def test_manual_crossing_adjustment_overrides_winner_and_is_reported_on_preview(tmp_path: Path):
+    project = create_project(tmp_path, params())
+    project.generate_chunks([ChunkKey(0, 0)])
+    road = LinearWorkOp(1, "road", -2.0, 0.0, 12.0, 0.0, 6.0, 4.0)
+    river = LinearWorkOp(2, "river", 0.0, -2.0, 0.0, 12.0, 6.0, 7.0, priority=1.0)
+    project.add_edit(road)
+    project.add_edit(river)
+    assert project.load_chunk(ChunkKey(0, 0))["heights"][0][0] == 7.0
+
+    crossing = CrossingEditOp(
+        id=next_edit_id(project.edits),
+        work_a=1,
+        work_b=2,
+        height=5.5,
+        radius=1.5,
+    )
+    preview = project.preview_edit(crossing)
+    assert preview["affected_chunks"] == [[0, 0]]
+    assert preview["crossings"][0]["kept"] == 2
+    assert load_project(tmp_path).edits == project.edits
+
+    affected, _ = project.add_edit_report(crossing)
+    assert affected == [ChunkKey(0, 0)]
+    assert project.load_chunk(ChunkKey(0, 0))["heights"][0][0] == 5.5
+
+
+def test_removing_one_work_invalidates_manual_crossing_with_explanation(tmp_path: Path):
+    project = create_project(tmp_path, params())
+    project.generate_chunks([ChunkKey(0, 0)])
+    road = RoadEditOp(1, -2.0, 0.0, 12.0, 0.0, 6.0, 4.0)
+    river = RiverEditOp(2, 0.0, -2.0, 0.0, 12.0, 6.0, -3.0)
+    project.add_edit(road)
+    project.add_edit(river)
+    crossing = CrossingEditOp(3, 1, 2, 1.0, 1.5)
+    project.add_edit(crossing)
+    assert project.load_chunk(ChunkKey(0, 0))["heights"][0][0] == 1.0
+
+    affected, invalidated = project.undo_edit(1)
+    assert affected == [ChunkKey(0, 0)]
+    assert invalidated == [
+        {
+            "edit_id": 3,
+            "state": "invalidated",
+            "retained": True,
+            "reason": "work 1 was removed",
+        }
+    ]
+
+    reloaded = load_project(tmp_path)
+    stored_crossing = next(edit for edit in reloaded.edits if edit.id == 3)
+    assert stored_crossing.state == "invalidated"
+    assert stored_crossing.reason == "work 1 was removed"
+    assert reloaded.load_chunk(ChunkKey(0, 0))["heights"][0][0] == pytest.approx(-3.0)
+
+    affected, invalidated = reloaded.undo_edit(3)
+    assert affected == []
+    assert invalidated == []
+
+
+def test_crossing_requires_existing_intersecting_works(tmp_path: Path):
+    project = create_project(tmp_path, params())
+    project.generate_chunks([ChunkKey(0, 0)])
+    project.add_edit(RoadEditOp(1, -2.0, 0.0, 12.0, 0.0, 2.0, 4.0))
+
+    missing = CrossingEditOp(2, 1, 9, 1.0, 1.0)
+    with pytest.raises(EditError, match="referenced work not found"):
+        project.add_edit(missing)
+
+    parallel = RiverEditOp(2, -2.0, 5.0, 12.0, 5.0, 2.0, -3.0)
+    project.add_edit(parallel)
+    disjoint = CrossingEditOp(3, 1, 2, 1.0, 1.0)
+    with pytest.raises(EditError, match="do not intersect"):
+        project.add_edit(disjoint)
+
+
+def test_negative_coordinate_chunks_are_deterministic_and_seamless(tmp_path: Path):
+    keys = [ChunkKey(-1, -1), ChunkKey(0, 0), ChunkKey(-1, 0), ChunkKey(0, -1)]
+    project = create_project(tmp_path / "a", params())
+    project.generate_chunks(keys)
+    road = LinearWorkOp(1, "road", -15.0, -5.0, 5.0, 5.0, 2.0, 6.0)
+    river = LinearWorkOp(2, "river", -5.0, 5.0, -5.0, -15.0, 2.0, -2.0, priority=2.0)
+    project.add_edit(road)
+    project.add_edit(river)
+    project.add_edit(CrossingEditOp(3, 1, 2, 1.5, 2.0))
+    assert project.check_loaded_seams() == []
+
+    rebuilt = create_project(tmp_path / "b", params())
+    rebuilt.edits = list(project.edits)
+    rebuilt.generate_chunks(list(reversed(keys)))
+    assert rebuilt.check_loaded_seams() == []
+    for key in keys:
+        assert rebuilt.load_chunk(key)["heights"] == project.load_chunk(key)["heights"]
+
+    reloaded = load_project(tmp_path / "a")
+    reloaded.generate_chunks(keys)
+    for key in keys:
+        assert reloaded.load_chunk(key)["heights"] == project.load_chunk(key)["heights"]
 
 
 def test_generation_is_consistent_across_processes_order_reopen_and_local_recompute(tmp_path: Path):

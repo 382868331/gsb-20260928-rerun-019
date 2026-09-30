@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .edits import EditOp, RoadEditOp, apply_edits
+from .edits import CrossingEditOp, EditOp, LinearWorkOp, apply_edits
 from .noise import terrain_height
 from .parameters import TerrainParameters
 
@@ -56,7 +56,7 @@ def base_height_at(params: TerrainParameters, x: float, y: float) -> float:
     )
 
 
-def generate_grid(params: TerrainParameters, key: ChunkKey, edits: list[EditOp | RoadEditOp]) -> dict:
+def generate_grid(params: TerrainParameters, key: ChunkKey, edits: list) -> dict:
     validate_chunk_key(key)
     ordered_edits = sorted(edits, key=lambda edit: edit.id)
     base = []
@@ -94,16 +94,28 @@ def generate_grid(params: TerrainParameters, key: ChunkKey, edits: list[EditOp |
     }
 
 
-def chunk_affected_by_edit(params: TerrainParameters, key: ChunkKey, edit: EditOp | RoadEditOp) -> bool:
+def chunk_affected_by_edit(params: TerrainParameters, key: ChunkKey, edit, works_by_id: dict | None = None) -> bool:
     min_x = key.x * params.chunk_size
     min_y = key.y * params.chunk_size
     max_x = min_x + params.chunk_size
     max_y = min_y + params.chunk_size
-    if isinstance(edit, RoadEditOp):
+    if isinstance(edit, LinearWorkOp):
         radius = edit.width / 2.0 + edit.shoulder
         return _segment_meets_expanded_rectangle(
             edit.x1, edit.y1, edit.x2, edit.y2, min_x, min_y, max_x, max_y, radius
         )
+    if isinstance(edit, CrossingEditOp):
+        if works_by_id is None or not edit.is_active(works_by_id):
+            return False
+        center = edit.center(works_by_id)
+        if center is None:
+            return False
+        cx, cy = center
+        nearest_x = min(max(cx, min_x), max_x)
+        nearest_y = min(max(cy, min_y), max_y)
+        dx = cx - nearest_x
+        dy = cy - nearest_y
+        return dx * dx + dy * dy < edit.radius * edit.radius
     nearest_x = min(max(edit.x, min_x), max_x)
     nearest_y = min(max(edit.y, min_y), max_y)
     dx = edit.x - nearest_x

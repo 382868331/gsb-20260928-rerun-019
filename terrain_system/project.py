@@ -5,7 +5,16 @@ import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from .edits import EditOp, RoadEditOp, edit_from_dict, next_edit_id
+from .edits import (
+    CrossingEditOp,
+    EditError,
+    EditOp,
+    LinearWorkOp,
+    choose_winner,
+    edit_from_dict,
+    next_edit_id,
+    segment_intersection,
+)
 from .model import ChunkKey, chunk_affected_by_edit, generate_grid, validate_chunk_key
 from .parameters import ParameterError, TerrainParameters
 from .stitch import check_seams
@@ -106,40 +115,154 @@ class TerrainProject:
             loaded[(key.x, key.y)] = data
         return loaded
 
-    def add_edit(self, edit: EditOp | RoadEditOp) -> list[ChunkKey]:
+    def add_edit(self, edit) -> list[ChunkKey]:
+        affected, _ = self.add_edit_report(edit)
+        return affected
+
+    def add_edit_report(self, edit) -> tuple[list[ChunkKey], list[dict]]:
         edit.validate()
         if edit.id <= 0 or edit.id in {stored.id for stored in self.edits}:
             raise EditError("edit id must be the next sequential id")
+        if isinstance(edit, CrossingEditOp):
+            works = self.linear_works()
+            for work_id in (edit.work_a, edit.work_b):
+                if work_id not in works:
+                    raise EditError(f"referenced work not found: {work_id}")
+            if segment_intersection(works[edit.work_a], works[edit.work_b]) is None:
+                raise EditError("the two works do not intersect")
         self.edits.append(edit)
 
+        works = self.linear_works()
         affected = []
         for stored_key in sorted(self.chunks):
             key = ChunkKey.parse(stored_key)
-            if chunk_affected_by_edit(self.parameters, key, edit):
+            if chunk_affected_by_edit(self.parameters, key, edit, works):
                 affected.append(key)
 
         for key in affected:
             grid = generate_grid(self.parameters, key, self.edits)
             _atomic_write(self.chunk_dir / key.filename, grid)
         self.save_manifest()
-        return affected
+        return affected, self.crossing_relations()
 
-    def undo_edit(self, edit_id: int) -> list[ChunkKey]:
+    def preview_edit(self, edit) -> dict:
+        edit.validate()
+        if edit.id <= 0 or edit.id in {stored.id for stored in self.edits}:
+            raise EditError("edit id must be the next sequential id")
+        works = self.linear_works()
+        if isinstance(edit, CrossingEditOp):
+            for work_id in (edit.work_a, edit.work_b):
+                if work_id not in works:
+                    raise EditError(f"referenced work not found: {work_id}")
+            if segment_intersection(works[edit.work_a], works[edit.work_b]) is None:
+                raise EditError("the two works do not intersect")
+        preview_works = dict(works)
+        if isinstance(edit, LinearWorkOp):
+            preview_works[edit.id] = edit
+        affected = [
+            key
+            for stored_key in sorted(self.chunks)
+            for key in [ChunkKey.parse(stored_key)]
+            if chunk_affected_by_edit(self.parameters, key, edit, preview_works)
+        ]
+        simulated = TerrainProject(
+            self.root, self.parameters, [*self.edits, edit], self.chunks
+        )
+        return {
+            "edit": edit.to_dict(),
+            "affected_chunks": [[key.x, key.y] for key in affected],
+            "crossings": simulated.crossing_relations(),
+        }
+
+    def linear_works(self) -> dict[int, LinearWorkOp]:
+        return {edit.id: edit for edit in self.edits if isinstance(edit, LinearWorkOp)}
+
+    def crossing_relations(self) -> list[dict]:
+        works = self.linear_works()
+        relations = []
+        work_ids = sorted(works)
+        for index, first_id in enumerate(work_ids):
+            for second_id in work_ids[index + 1 :]:
+                first = works[first_id]
+                second = works[second_id]
+                point = segment_intersection(first, second)
+                if point is None:
+                    continue
+                winner = choose_winner(first, second)
+                loser = second if winner is first else first
+                relations.append(
+                    {
+                        "work_a": first.id,
+                        "work_b": second.id,
+                        "point": [point[0], point[1]],
+                        "kept": winner.id,
+                        "overridden": loser.id,
+                        "rule": "higher priority; earlier id breaks ties",
+                    }
+                )
+        return relations
+
+    def undo_edit(self, edit_id: int) -> tuple[list[ChunkKey], list[dict]]:
         removed = next((edit for edit in self.edits if edit.id == edit_id), None)
         if removed is None:
             raise EditError(f"edit not found: {edit_id}")
 
-        affected = [
-            ChunkKey.parse(stored_key)
-            for stored_key in sorted(self.chunks)
-            if chunk_affected_by_edit(self.parameters, ChunkKey.parse(stored_key), removed)
-        ]
+        works_before = self.linear_works()
+        affected_set = {
+            key
+            for stored_key in self.chunks
+            for key in [ChunkKey.parse(stored_key)]
+            if chunk_affected_by_edit(self.parameters, key, removed, works_before)
+        }
+
+        invalidated: list[dict] = []
+        surviving_crossings: list[CrossingEditOp] = []
+        for edit in self.edits:
+            if not isinstance(edit, CrossingEditOp):
+                continue
+            if edit.state == "active" and edit_id in edit.work_ids():
+                reason = f"work {edit_id} was removed"
+                invalidated.append(
+                    {
+                        "edit_id": edit.id,
+                        "state": "invalidated",
+                        "retained": True,
+                        "reason": reason,
+                    }
+                )
+                edit = CrossingEditOp(
+                    id=edit.id,
+                    work_a=edit.work_a,
+                    work_b=edit.work_b,
+                    height=edit.height,
+                    radius=edit.radius,
+                    state="invalidated",
+                    reason=reason,
+                )
+            surviving_crossings.append(edit)
+
         self.edits = [edit for edit in self.edits if edit.id != edit_id]
+        self.edits = [edit for edit in self.edits if not isinstance(edit, CrossingEditOp)]
+        self.edits.extend(
+            edit for edit in surviving_crossings if edit.id != edit_id
+        )
+        self.edits.sort(key=lambda edit: edit.id)
+
+        works_after = self.linear_works()
+        for edit in surviving_crossings:
+            if edit.id == edit_id:
+                continue
+            for stored_key in self.chunks:
+                key = ChunkKey.parse(stored_key)
+                if chunk_affected_by_edit(self.parameters, key, edit, works_after):
+                    affected_set.add(key)
+
+        affected = sorted(affected_set, key=lambda key: (key.x, key.y))
         for key in affected:
             grid = generate_grid(self.parameters, key, self.edits)
             _atomic_write(self.chunk_dir / key.filename, grid)
         self.save_manifest()
-        return affected
+        return affected, invalidated
 
     def check_loaded_seams(self, tolerance: float = 0.0):
         return check_seams(self.load_all_chunks(), tolerance=tolerance)
