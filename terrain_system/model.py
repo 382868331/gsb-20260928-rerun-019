@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .edits import EditOp, apply_edits
+from .edits import EditOp, compose_edits
 from .noise import terrain_height
 from .parameters import TerrainParameters
 
@@ -70,7 +70,7 @@ def generate_grid(params: TerrainParameters, key: ChunkKey, edits: list[EditOp])
         for column in range(params.resolution):
             x, y = world_point(params, key, column, row)
             generated = base_height_at(params, x, y)
-            height = generated + apply_edits(x, y, ordered_edits)
+            height = compose_edits(lambda px, py: base_height_at(params, px, py), x, y, ordered_edits)
             base_row.append(generated)
             height_row.append(height)
             min_height = min(min_height, height)
@@ -99,8 +99,5 @@ def chunk_affected_by_edit(params: TerrainParameters, key: ChunkKey, edit: EditO
     min_y = key.y * params.chunk_size
     max_x = min_x + params.chunk_size
     max_y = min_y + params.chunk_size
-    nearest_x = min(max(edit.x, min_x), max_x)
-    nearest_y = min(max(edit.y, min_y), max_y)
-    dx = edit.x - nearest_x
-    dy = edit.y - nearest_y
-    return dx * dx + dy * dy < edit.radius * edit.radius
+    edit_min_x, edit_min_y, edit_max_x, edit_max_y = edit.influence_bounds()
+    return edit_max_x > min_x and edit_min_x < max_x and edit_max_y > min_y and edit_min_y < max_y

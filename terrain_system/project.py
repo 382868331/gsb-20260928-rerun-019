@@ -108,8 +108,8 @@ class TerrainProject:
 
     def add_edit(self, edit: EditOp) -> list[ChunkKey]:
         edit.validate()
-        if edit.id != next_edit_id(self.edits):
-            raise EditError("edit id must be the next sequential id")
+        if any(existing.id == edit.id for existing in self.edits):
+            raise EditError("edit id must be unique")
         self.edits.append(edit)
 
         affected = []
@@ -123,6 +123,19 @@ class TerrainProject:
             _atomic_write(self.chunk_dir / key.filename, grid)
         self.save_manifest()
         return affected
+
+    def remove_edit(self, edit_id: int) -> list[ChunkKey]:
+        """Withdraw one edit and recompute every generated chunk deterministically."""
+        remaining = [edit for edit in self.edits if edit.id != edit_id]
+        if len(remaining) == len(self.edits):
+            raise EditError("no edit with id " + str(edit_id))
+        self.edits = remaining
+        keys = [ChunkKey.parse(stored_key) for stored_key in sorted(self.chunks)]
+        for key in keys:
+            grid = generate_grid(self.parameters, key, self.edits)
+            _atomic_write(self.chunk_dir / key.filename, grid)
+        self.save_manifest()
+        return keys
 
     def check_loaded_seams(self, tolerance: float = 0.0):
         return check_seams(self.load_all_chunks(), tolerance=tolerance)
@@ -156,9 +169,9 @@ def load_project(root: Path) -> TerrainProject:
     if not isinstance(raw_edits, list) or not isinstance(raw_chunks, dict):
         raise ProjectError("invalid project manifest")
     edits = [EditOp.from_dict(value) for value in raw_edits]
-    expected_ids = list(range(1, len(edits) + 1))
-    if [edit.id for edit in edits] != expected_ids:
-        raise ProjectError("edit ids must be sequential starting at 1")
+    ids = [edit.id for edit in edits]
+    if len(set(ids)) != len(ids):
+        raise ProjectError("edit ids must be unique")
 
     chunks = {}
     for key, path in raw_chunks.items():

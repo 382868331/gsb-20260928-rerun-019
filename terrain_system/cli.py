@@ -25,6 +25,13 @@ def _positive_float(value: str) -> float:
     return number
 
 
+def _non_negative_float(value: str) -> float:
+    number = float(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
+    return number
+
+
 def _finite_float(value: str) -> float:
     number = float(value)
     if number != number or number in (float("inf"), float("-inf")):
@@ -61,12 +68,30 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument("--delta", type=float, required=True, help="positive raises; negative lowers")
     edit.add_argument("--falloff", type=_positive_float, default=2.0)
 
+    road = subparsers.add_parser("road", help="flatten a cross-chunk road with a smooth shoulder")
+    road.add_argument("project", type=Path)
+    road.add_argument("--x1", type=float, required=True)
+    road.add_argument("--y1", type=float, required=True)
+    road.add_argument("--x2", type=float, required=True)
+    road.add_argument("--y2", type=float, required=True)
+    road.add_argument("--half-width", type=_positive_float, required=True)
+    road.add_argument("--shoulder", type=_non_negative_float, default=0.0,
+                       help="extra width over which the road eases back to terrain")
+
+    undo = subparsers.add_parser("undo", help="withdraw one edit by id and recompute chunks")
+    undo.add_argument("project", type=Path)
+    undo.add_argument("--id", type=int, required=True)
+
     stitch = subparsers.add_parser("stitch", help="check generated adjacent chunk boundaries")
     stitch.add_argument("project", type=Path)
     stitch.add_argument("--tolerance", type=_finite_float, default=0.0)
 
     info = subparsers.add_parser("info", help="show project metadata")
     info.add_argument("project", type=Path)
+
+    dump = subparsers.add_parser("dump", help="print stored base and final heights of one chunk")
+    dump.add_argument("project", type=Path)
+    dump.add_argument("chunk", help="chunk coordinate, for example 0,0")
     return parser
 
 
@@ -101,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
                 "chunks": [[grid["chunk"]["x"], grid["chunk"]["y"]] for grid in grids],
             })
         elif args.command == "edit":
-            edit = EditOp(
+            edit = EditOp.raise_op(
                 id=next_edit_id(project.edits),
                 x=args.x,
                 y=args.y,
@@ -114,6 +139,29 @@ def main(argv: list[str] | None = None) -> int:
                 "status": "edited",
                 "edit_id": edit.id,
                 "updated_chunks": [[key.x, key.y] for key in affected],
+            })
+        elif args.command == "road":
+            road = EditOp.road_op(
+                id=next_edit_id(project.edits),
+                x1=args.x1,
+                y1=args.y1,
+                x2=args.x2,
+                y2=args.y2,
+                half_width=args.half_width,
+                shoulder=args.shoulder,
+            )
+            affected = project.add_edit(road)
+            _print_json({
+                "status": "edited",
+                "edit_id": road.id,
+                "updated_chunks": [[key.x, key.y] for key in affected],
+            })
+        elif args.command == "undo":
+            updated = project.remove_edit(args.id)
+            _print_json({
+                "status": "undone",
+                "edit_id": args.id,
+                "recomputed_chunks": [[key.x, key.y] for key in updated],
             })
         elif args.command == "stitch":
             loaded_chunks = project.load_all_chunks()
@@ -138,6 +186,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if not mismatches else 2
         elif args.command == "info":
             _print_json(project.to_dict())
+        elif args.command == "dump":
+            grid = project.load_chunk(ChunkKey.parse(args.chunk))
+            _print_json({
+                "chunk": [grid["chunk"]["x"], grid["chunk"]["y"]],
+                "base_heights": grid["base_heights"],
+                "heights": grid["heights"],
+            })
         else:
             parser.error("unknown command")
     except (ParameterError, EditError, ProjectError, FileExistsError, FileNotFoundError, ValueError) as exc:
