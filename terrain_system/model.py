@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .edits import EditOp, apply_edits
+from .edits import EditOp, RoadEditOp, apply_edits
 from .noise import terrain_height
 from .parameters import TerrainParameters
 
@@ -56,7 +56,7 @@ def base_height_at(params: TerrainParameters, x: float, y: float) -> float:
     )
 
 
-def generate_grid(params: TerrainParameters, key: ChunkKey, edits: list[EditOp]) -> dict:
+def generate_grid(params: TerrainParameters, key: ChunkKey, edits: list[EditOp | RoadEditOp]) -> dict:
     validate_chunk_key(key)
     ordered_edits = sorted(edits, key=lambda edit: edit.id)
     base = []
@@ -70,7 +70,7 @@ def generate_grid(params: TerrainParameters, key: ChunkKey, edits: list[EditOp])
         for column in range(params.resolution):
             x, y = world_point(params, key, column, row)
             generated = base_height_at(params, x, y)
-            height = generated + apply_edits(x, y, ordered_edits)
+            height = apply_edits(generated, x, y, ordered_edits)
             base_row.append(generated)
             height_row.append(height)
             min_height = min(min_height, height)
@@ -94,13 +94,53 @@ def generate_grid(params: TerrainParameters, key: ChunkKey, edits: list[EditOp])
     }
 
 
-def chunk_affected_by_edit(params: TerrainParameters, key: ChunkKey, edit: EditOp) -> bool:
+def chunk_affected_by_edit(params: TerrainParameters, key: ChunkKey, edit: EditOp | RoadEditOp) -> bool:
     min_x = key.x * params.chunk_size
     min_y = key.y * params.chunk_size
     max_x = min_x + params.chunk_size
     max_y = min_y + params.chunk_size
+    if isinstance(edit, RoadEditOp):
+        radius = edit.width / 2.0 + edit.shoulder
+        return _segment_meets_expanded_rectangle(
+            edit.x1, edit.y1, edit.x2, edit.y2, min_x, min_y, max_x, max_y, radius
+        )
     nearest_x = min(max(edit.x, min_x), max_x)
     nearest_y = min(max(edit.y, min_y), max_y)
     dx = edit.x - nearest_x
     dy = edit.y - nearest_y
     return dx * dx + dy * dy < edit.radius * edit.radius
+
+
+def _segment_meets_expanded_rectangle(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    min_x: float,
+    min_y: float,
+    max_x: float,
+    max_y: float,
+    radius: float,
+) -> bool:
+    min_x -= radius
+    min_y -= radius
+    max_x += radius
+    max_y += radius
+    if min_x <= x1 <= max_x and min_y <= y1 <= max_y:
+        return True
+    if min_x <= x2 <= max_x and min_y <= y2 <= max_y:
+        return True
+
+    def segments_cross(ax, ay, bx, by, cx, cy, dx, dy):
+        first = (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+        second = (bx - ax) * (dy - ay) - (by - ay) * (dx - ax)
+        third = (dx - cx) * (ay - cy) - (dy - cy) * (ax - cx)
+        fourth = (dx - cx) * (by - cy) - (dy - cy) * (bx - cx)
+        return first * second <= 0 and third * fourth <= 0
+
+    corners = ((min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y))
+    for index, (cx, cy) in enumerate(corners):
+        nx, ny = corners[(index + 1) % 4]
+        if segments_cross(x1, y1, x2, y2, cx, cy, nx, ny):
+            return True
+    return False

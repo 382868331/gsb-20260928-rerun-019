@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .edits import EditError, EditOp, next_edit_id
+from .edits import EditError, EditOp, RoadEditOp, next_edit_id
 from .model import ChunkKey
 from .parameters import ParameterError, TerrainParameters
 from .project import ProjectError, create_project, load_project
@@ -22,6 +22,13 @@ def _positive_float(value: str) -> float:
     number = float(value)
     if number <= 0:
         raise argparse.ArgumentTypeError("value must be positive")
+    return number
+
+
+def _non_negative_float(value: str) -> float:
+    number = float(value)
+    if number < 0:
+        raise argparse.ArgumentTypeError("value must be non-negative")
     return number
 
 
@@ -60,6 +67,20 @@ def build_parser() -> argparse.ArgumentParser:
     edit.add_argument("--radius", type=_positive_float, required=True)
     edit.add_argument("--delta", type=float, required=True, help="positive raises; negative lowers")
     edit.add_argument("--falloff", type=_positive_float, default=2.0)
+
+    road = subparsers.add_parser("road", help="flatten and smooth a road segment")
+    road.add_argument("project", type=Path)
+    road.add_argument("--x1", type=float, required=True)
+    road.add_argument("--y1", type=float, required=True)
+    road.add_argument("--x2", type=float, required=True)
+    road.add_argument("--y2", type=float, required=True)
+    road.add_argument("--width", type=_positive_float, required=True)
+    road.add_argument("--height", type=float, required=True)
+    road.add_argument("--shoulder", type=_non_negative_float, default=0.0)
+
+    undo = subparsers.add_parser("undo", help="remove one persistent edit and replay the rest")
+    undo.add_argument("project", type=Path)
+    undo.add_argument("--id", type=int)
 
     stitch = subparsers.add_parser("stitch", help="check generated adjacent chunk boundaries")
     stitch.add_argument("project", type=Path)
@@ -113,6 +134,34 @@ def main(argv: list[str] | None = None) -> int:
             _print_json({
                 "status": "edited",
                 "edit_id": edit.id,
+                "updated_chunks": [[key.x, key.y] for key in affected],
+            })
+        elif args.command == "road":
+            edit = RoadEditOp(
+                id=next_edit_id(project.edits),
+                x1=args.x1,
+                y1=args.y1,
+                x2=args.x2,
+                y2=args.y2,
+                width=args.width,
+                height=args.height,
+                shoulder=args.shoulder,
+            )
+            affected = project.add_edit(edit)
+            _print_json({
+                "status": "edited",
+                "edit_id": edit.id,
+                "kind": "road",
+                "updated_chunks": [[key.x, key.y] for key in affected],
+            })
+        elif args.command == "undo":
+            edit_id = args.id if args.id is not None else max((edit.id for edit in project.edits), default=0)
+            if edit_id < 1:
+                raise EditError("there are no edits to undo")
+            affected = project.undo_edit(edit_id)
+            _print_json({
+                "status": "undone",
+                "edit_id": edit_id,
                 "updated_chunks": [[key.x, key.y] for key in affected],
             })
         elif args.command == "stitch":

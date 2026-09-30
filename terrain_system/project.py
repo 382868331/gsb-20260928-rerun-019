@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
-from .edits import EditOp, EditError, next_edit_id
+from .edits import EditOp, RoadEditOp, edit_from_dict, next_edit_id
 from .model import ChunkKey, chunk_affected_by_edit, generate_grid, validate_chunk_key
 from .parameters import ParameterError, TerrainParameters
 from .stitch import check_seams
@@ -48,7 +48,7 @@ def _read_json(path: Path) -> dict:
 
 
 class TerrainProject:
-    def __init__(self, root: Path, parameters: TerrainParameters, edits: list[EditOp], chunks: dict[str, str]):
+    def __init__(self, root: Path, parameters: TerrainParameters, edits: list[EditOp | RoadEditOp], chunks: dict[str, str]):
         self.root = root
         self.parameters = parameters
         self.edits = sorted(edits, key=lambda edit: edit.id)
@@ -106,9 +106,9 @@ class TerrainProject:
             loaded[(key.x, key.y)] = data
         return loaded
 
-    def add_edit(self, edit: EditOp) -> list[ChunkKey]:
+    def add_edit(self, edit: EditOp | RoadEditOp) -> list[ChunkKey]:
         edit.validate()
-        if edit.id != next_edit_id(self.edits):
+        if edit.id <= 0 or edit.id in {stored.id for stored in self.edits}:
             raise EditError("edit id must be the next sequential id")
         self.edits.append(edit)
 
@@ -118,6 +118,23 @@ class TerrainProject:
             if chunk_affected_by_edit(self.parameters, key, edit):
                 affected.append(key)
 
+        for key in affected:
+            grid = generate_grid(self.parameters, key, self.edits)
+            _atomic_write(self.chunk_dir / key.filename, grid)
+        self.save_manifest()
+        return affected
+
+    def undo_edit(self, edit_id: int) -> list[ChunkKey]:
+        removed = next((edit for edit in self.edits if edit.id == edit_id), None)
+        if removed is None:
+            raise EditError(f"edit not found: {edit_id}")
+
+        affected = [
+            ChunkKey.parse(stored_key)
+            for stored_key in sorted(self.chunks)
+            if chunk_affected_by_edit(self.parameters, ChunkKey.parse(stored_key), removed)
+        ]
+        self.edits = [edit for edit in self.edits if edit.id != edit_id]
         for key in affected:
             grid = generate_grid(self.parameters, key, self.edits)
             _atomic_write(self.chunk_dir / key.filename, grid)
@@ -155,10 +172,10 @@ def load_project(root: Path) -> TerrainProject:
 
     if not isinstance(raw_edits, list) or not isinstance(raw_chunks, dict):
         raise ProjectError("invalid project manifest")
-    edits = [EditOp.from_dict(value) for value in raw_edits]
-    expected_ids = list(range(1, len(edits) + 1))
-    if [edit.id for edit in edits] != expected_ids:
-        raise ProjectError("edit ids must be sequential starting at 1")
+    edits = [edit_from_dict(value) for value in raw_edits]
+    edit_ids = [edit.id for edit in edits]
+    if len(edit_ids) != len(set(edit_ids)) or any(edit_id < 1 for edit_id in edit_ids):
+        raise ProjectError("edit ids must be unique positive integers")
 
     chunks = {}
     for key, path in raw_chunks.items():
