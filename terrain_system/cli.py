@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .edits import EditError, EditOp, JunctionAdjustmentOp, LinearWorkOp, next_edit_id
+from .edits import EditError, EditOp, JunctionAdjustmentOp, LinearWorkOp, TransitionOp, next_edit_id
 from .model import ChunkKey
 from .parameters import ParameterError, TerrainParameters
 from .project import ProjectError, create_project, load_project
@@ -108,6 +108,55 @@ def build_parser() -> argparse.ArgumentParser:
     undo = subparsers.add_parser("undo", help="remove one persistent edit and replay the rest")
     undo.add_argument("project", type=Path)
     undo.add_argument("--id", type=int)
+
+    stage = subparsers.add_parser("stage", help="add a construction stage")
+    stage.add_argument("project", type=Path)
+    stage.add_argument("--name", required=True)
+
+    schedule = subparsers.add_parser("schedule", help="schedule a work (or a portion of it) at a stage")
+    schedule.add_argument("project", type=Path)
+    schedule.add_argument("--work", type=int, required=True)
+    schedule.add_argument("--stage", type=int, required=True)
+    schedule.add_argument("--start", type=float, help="portion start as fraction along the line")
+    schedule.add_argument("--end", type=float, help="portion end as fraction along the line")
+
+    demolish = subparsers.add_parser("demolish", help="schedule demolition of a built work at a stage")
+    demolish.add_argument("project", type=Path)
+    demolish.add_argument("--work", type=int, required=True)
+    demolish.add_argument("--stage", type=int, required=True)
+
+    transition = subparsers.add_parser("transition", help="add a temporary transition surface")
+    transition.add_argument("project", type=Path)
+    transition.add_argument("--x1", type=float, required=True)
+    transition.add_argument("--y1", type=float, required=True)
+    transition.add_argument("--x2", type=float, required=True)
+    transition.add_argument("--y2", type=float, required=True)
+    transition.add_argument("--width", type=_positive_float, required=True)
+    transition.add_argument("--height", type=float, required=True)
+    transition.add_argument("--shoulder", type=_non_negative_float, default=0.0)
+    transition.add_argument("--priority", type=int, default=0)
+    transition.add_argument("--built-stage", type=int, required=True)
+    transition.add_argument("--demolish-stage", type=int)
+
+    revise = subparsers.add_parser("revise", help="revise the unbuilt design of a partially built work")
+    revise.add_argument("project", type=Path)
+    revise.add_argument("--work", type=int, required=True)
+    revise.add_argument("--x1", type=float, required=True)
+    revise.add_argument("--y1", type=float, required=True)
+    revise.add_argument("--x2", type=float, required=True)
+    revise.add_argument("--y2", type=float, required=True)
+    revise.add_argument("--width", type=_positive_float, required=True)
+    revise.add_argument("--height", type=float, required=True)
+    revise.add_argument("--shoulder", type=_non_negative_float, default=0.0)
+    revise.add_argument("--priority", type=int)
+
+    view = subparsers.add_parser("view", help="show the terrain of one chunk at a construction stage")
+    view.add_argument("project", type=Path)
+    view.add_argument("--stage", type=int, required=True)
+    view.add_argument("--chunk", required=True)
+
+    plan = subparsers.add_parser("plan", help="list stages with permanent works and temporary transitions")
+    plan.add_argument("project", type=Path)
 
     stitch = subparsers.add_parser("stitch", help="check generated adjacent chunk boundaries")
     stitch.add_argument("project", type=Path)
@@ -251,6 +300,84 @@ def main(argv: list[str] | None = None) -> int:
             }
             _print_json(payload)
             return 0 if not mismatches else 2
+        elif args.command == "stage":
+            stage = project.add_stage(args.name)
+            _print_json({"status": "staged", "stage_id": stage.id, "name": stage.name})
+        elif args.command == "schedule":
+            entry = project.add_schedule_entry(args.work, args.stage, args.start, args.end)
+            _print_json({
+                "status": "scheduled",
+                "work_id": entry.work_id,
+                "stage": entry.stage,
+                "portion": list(entry.portion()),
+            })
+        elif args.command == "demolish":
+            demolition = project.add_demolition(args.work, args.stage)
+            _print_json({
+                "status": "demolition_scheduled",
+                "work_id": demolition.work_id,
+                "stage": demolition.stage,
+            })
+        elif args.command == "transition":
+            edit = TransitionOp(
+                id=next_edit_id(project.edits),
+                x1=args.x1,
+                y1=args.y1,
+                x2=args.x2,
+                y2=args.y2,
+                width=args.width,
+                height=args.height,
+                shoulder=args.shoulder,
+                priority=args.priority,
+                built_stage=args.built_stage,
+                demolish_stage=args.demolish_stage,
+            )
+            affected = project.add_edit(edit)
+            _print_json({
+                "status": "edited",
+                "edit_id": edit.id,
+                "kind": "transition",
+                "built_stage": edit.built_stage,
+                "demolish_stage": edit.demolish_stage,
+                "updated_chunks": [[key.x, key.y] for key in affected],
+            })
+        elif args.command == "revise":
+            geometry = {
+                "x1": args.x1,
+                "y1": args.y1,
+                "x2": args.x2,
+                "y2": args.y2,
+                "width": args.width,
+                "height": args.height,
+                "shoulder": args.shoulder,
+            }
+            if args.priority is not None:
+                geometry["priority"] = args.priority
+            result = project.revise_work(args.work, **geometry)
+            _print_json({
+                "status": "revised",
+                "kept_work": result["kept_work"].id,
+                "new_edit_id": result["new_edit"].id,
+                "built_intervals": result["built_intervals"],
+                "connections": result["connections"],
+                "suggest_transition": result["suggest_transition"],
+            })
+        elif args.command == "view":
+            key = ChunkKey.parse(args.chunk)
+            view = project.view_at_stage(args.stage, key)
+            _print_json({
+                "status": "view",
+                "stage": args.stage,
+                "chunk": [key.x, key.y],
+                "counts": view["counts"],
+                "min_height": view["grid"]["min_height"],
+                "max_height": view["grid"]["max_height"],
+                "active_works": view["active_works"],
+                "active_transitions": view["active_transitions"],
+                "demolished_works": view["demolished_works"],
+            })
+        elif args.command == "plan":
+            _print_json({"status": "plan", **project.plan_summary()})
         elif args.command == "info":
             _print_json(project.to_dict())
         else:

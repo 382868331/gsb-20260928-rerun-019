@@ -7,13 +7,23 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from .edits import (
+    EditError,
+    EditOp,
     JunctionAdjustmentOp,
     LinearWorkOp,
+    TransitionOp,
     edit_from_dict,
     next_edit_id,
 )
 from .model import ChunkKey, chunk_affected_by_edit, generate_grid, validate_chunk_key
 from .parameters import ParameterError, TerrainParameters
+from .schedule import (
+    Demolition,
+    ScheduleEntry,
+    Stage,
+    built_intervals,
+    view_edits,
+)
 from .stitch import check_seams
 
 
@@ -76,12 +86,18 @@ class TerrainProject:
         edits: list,
         chunks: dict[str, str],
         voided_edits: list[dict] | None = None,
+        stages: list[Stage] | None = None,
+        schedule: list[ScheduleEntry] | None = None,
+        demolitions: list[Demolition] | None = None,
     ):
         self.root = root
         self.parameters = parameters
         self.edits = sorted(edits, key=lambda edit: edit.id)
         self.chunks = dict(chunks)
         self.voided_edits = list(voided_edits or [])
+        self.stages = sorted(stages or [], key=lambda stage: stage.id)
+        self.schedule = list(schedule or [])
+        self.demolitions = list(demolitions or [])
 
     @property
     def chunk_dir(self) -> Path:
@@ -94,17 +110,37 @@ class TerrainProject:
             "edits": [edit.to_dict() for edit in self.edits],
             "chunks": dict(sorted(self.chunks.items())),
             "voided_edits": list(self.voided_edits),
+            "stages": [stage.to_dict() for stage in self.stages],
+            "schedule": [entry.to_dict() for entry in self.schedule],
+            "demolitions": [demolition.to_dict() for demolition in self.demolitions],
         }
 
     def linear_works(self) -> list[LinearWorkOp]:
-        return [edit for edit in self.edits if isinstance(edit, LinearWorkOp)]
+        return [
+            edit
+            for edit in self.edits
+            if isinstance(edit, LinearWorkOp) and not isinstance(edit, TransitionOp)
+        ]
+
+    def final_edits(self) -> list:
+        return view_edits(self.edits, self.schedule, self.demolitions, None)
+
+    def stage_edits(self, stage_id: int) -> list:
+        return view_edits(self.edits, self.schedule, self.demolitions, stage_id)
+
+    def _regenerate_stored_chunks(self) -> None:
+        edits = self.final_edits()
+        for stored_key in sorted(self.chunks):
+            key = ChunkKey.parse(stored_key)
+            grid = generate_grid(self.parameters, key, edits)
+            _atomic_write(self.chunk_dir / key.filename, grid)
 
     def save_manifest(self) -> None:
         _atomic_write(self.root / PROJECT_FILE, self.to_dict())
 
     def save_chunk(self, key: ChunkKey) -> dict:
         validate_chunk_key(key)
-        grid = generate_grid(self.parameters, key, self.edits)
+        grid = generate_grid(self.parameters, key, self.final_edits())
         chunk_path = self.chunk_dir / key.filename
         _atomic_write(chunk_path, grid)
         self.chunks[str(key)] = CHUNK_DIR + "/" + key.filename
@@ -153,6 +189,11 @@ class TerrainProject:
             raise EditError("edit id must be the next sequential id")
         if isinstance(edit, JunctionAdjustmentOp):
             self._validate_junction_references(edit)
+        if isinstance(edit, TransitionOp):
+            known = {stage.id for stage in self.stages}
+            for stage_id in (edit.built_stage, edit.demolish_stage):
+                if stage_id is not None and stage_id not in known:
+                    raise EditError(f"transition references missing stage: {stage_id}")
         self.edits.append(edit)
 
         affected = []
@@ -162,10 +203,206 @@ class TerrainProject:
                 affected.append(key)
 
         for key in affected:
-            grid = generate_grid(self.parameters, key, self.edits)
+            grid = generate_grid(self.parameters, key, self.final_edits())
             _atomic_write(self.chunk_dir / key.filename, grid)
         self.save_manifest()
         return affected
+
+    def _find_work(self, work_id: int):
+        edit = next((item for item in self.edits if item.id == work_id), None)
+        if edit is None:
+            raise EditError(f"edit not found: {work_id}")
+        return edit
+
+    def _find_stage(self, stage_id: int) -> Stage:
+        stage = next((item for item in self.stages if item.id == stage_id), None)
+        if stage is None:
+            raise EditError(f"stage not found: {stage_id}")
+        return stage
+
+    def add_stage(self, name: str) -> Stage:
+        stage = Stage(id=max((item.id for item in self.stages), default=0) + 1, name=name)
+        stage.validate()
+        self.stages.append(stage)
+        self.stages.sort(key=lambda item: item.id)
+        self.save_manifest()
+        return stage
+
+    def add_schedule_entry(self, work_id: int, stage_id: int,
+                           start: float | None = None, end: float | None = None) -> ScheduleEntry:
+        self._find_stage(stage_id)
+        work = self._find_work(work_id)
+        if isinstance(work, TransitionOp):
+            raise EditError("transitions are scheduled via built_stage/demolish_stage")
+        if isinstance(work, JunctionAdjustmentOp) and (start is not None or end is not None):
+            raise EditError("junction revisions only support whole-work scheduling")
+        if not isinstance(work, (LinearWorkOp, JunctionAdjustmentOp)):
+            raise EditError("only roads, rivers and junctions can be scheduled")
+        entry = ScheduleEntry(work_id=work_id, stage=stage_id, start=start, end=end)
+        entry.validate()
+        self.schedule.append(entry)
+        self._regenerate_stored_chunks()
+        self.save_manifest()
+        return entry
+
+    def add_demolition(self, work_id: int, stage_id: int) -> Demolition:
+        self._find_stage(stage_id)
+        work = self._find_work(work_id)
+        if not isinstance(work, LinearWorkOp):
+            raise EditError("only linear works and transitions can be demolished")
+        demolition = Demolition(work_id=work_id, stage=stage_id)
+        demolition.validate()
+        self.demolitions.append(demolition)
+        self._regenerate_stored_chunks()
+        self.save_manifest()
+        return demolition
+
+    def revise_work(self, work_id: int, **geometry) -> dict:
+        """Revise the remaining design of a partially built work.
+
+        The old work and its schedule entries stay untouched, so the already
+        built portions keep their as-built terrain. The new design becomes a
+        new unscheduled edit; the returned connections report the height
+        difference between the new design and each built front.
+        """
+        work = self._find_work(work_id)
+        if not isinstance(work, LinearWorkOp) or isinstance(work, TransitionOp):
+            raise EditError("only roads and rivers can be revised")
+        intervals = built_intervals(work_id, self.schedule, None)
+        if not intervals:
+            raise EditError(f"work {work_id} has no built portions; undo it instead of revising")
+        candidate = LinearWorkOp(
+            id=next_edit_id(self.edits),
+            kind=work.kind,
+            x1=geometry["x1"],
+            y1=geometry["y1"],
+            x2=geometry["x2"],
+            y2=geometry["y2"],
+            width=geometry["width"],
+            height=geometry["height"],
+            shoulder=geometry.get("shoulder", 0.0),
+            priority=geometry.get("priority", work.priority),
+        )
+        candidate.validate()
+
+        connections = []
+        length_x = work.x2 - work.x1
+        length_y = work.y2 - work.y1
+        for start, end in intervals:
+            for t in (start, end):
+                px = work.x1 + t * length_x
+                py = work.y1 + t * length_y
+                within = candidate.distance_to_segment(px, py) <= candidate.influence_radius()
+                new_height = candidate.height if within else None
+                connections.append({
+                    "point": [px, py],
+                    "existing_height": work.height,
+                    "new_height": new_height,
+                    "delta": None if new_height is None else new_height - work.height,
+                })
+
+        self.edits.append(candidate)
+        self.edits.sort(key=lambda edit: edit.id)
+        self._regenerate_stored_chunks()
+        self.save_manifest()
+        needs_transition = any(
+            item["delta"] not in (None, 0.0) for item in connections
+        )
+        return {
+            "new_edit": candidate,
+            "kept_work": work,
+            "built_intervals": [list(item) for item in intervals],
+            "connections": connections,
+            "suggest_transition": needs_transition,
+        }
+
+    def view_at_stage(self, stage_id: int, key: ChunkKey) -> dict:
+        self._find_stage(stage_id)
+        edits = self.stage_edits(stage_id)
+        grid = generate_grid(self.parameters, key, edits)
+        works = [edit for edit in edits if isinstance(edit, LinearWorkOp)]
+        counts = {"completed": 0, "temporary": 0, "unbuilt": 0}
+        step = self.parameters.chunk_size / (self.parameters.resolution - 1)
+        for row in range(self.parameters.resolution):
+            for column in range(self.parameters.resolution):
+                x = key.x * self.parameters.chunk_size + column * step
+                y = key.y * self.parameters.chunk_size + row * step
+                permanent = False
+                temporary = False
+                for work in works:
+                    if work.core_weight_at(x, y) <= 0.0:
+                        continue
+                    if isinstance(work, TransitionOp):
+                        temporary = True
+                    else:
+                        permanent = True
+                if permanent:
+                    counts["completed"] += 1
+                elif temporary:
+                    counts["temporary"] += 1
+                else:
+                    counts["unbuilt"] += 1
+        demolished = [
+            demolition.work_id
+            for demolition in self.demolitions
+            if demolition.stage <= stage_id
+        ]
+        return {
+            "grid": grid,
+            "counts": counts,
+            "active_works": [work.id for work in works if not isinstance(work, TransitionOp)],
+            "active_transitions": [work.id for work in works if isinstance(work, TransitionOp)],
+            "demolished_works": sorted(demolished),
+        }
+
+    def plan_summary(self) -> dict:
+        scheduled_ids = {entry.work_id for entry in self.schedule}
+        transition_ids = {edit.id for edit in self.edits if isinstance(edit, TransitionOp)}
+        stages = []
+        for stage in self.stages:
+            permanent = []
+            for entry in self.schedule:
+                if entry.stage != stage.id:
+                    continue
+                work = next((edit for edit in self.edits if edit.id == entry.work_id), None)
+                if work is None:
+                    continue
+                permanent.append({
+                    "work_id": entry.work_id,
+                    "kind": work.type_name,
+                    "portion": list(entry.portion()),
+                })
+            transitions_built = [
+                edit.id
+                for edit in self.edits
+                if isinstance(edit, TransitionOp) and edit.built_stage == stage.id
+            ]
+            transitions_demolished = [
+                edit.id
+                for edit in self.edits
+                if isinstance(edit, TransitionOp) and edit.demolish_stage == stage.id
+            ]
+            demolitions = [
+                demolition.work_id
+                for demolition in self.demolitions
+                if demolition.stage == stage.id
+            ]
+            stages.append({
+                "id": stage.id,
+                "name": stage.name,
+                "permanent": permanent,
+                "transitions_built": sorted(transitions_built),
+                "transitions_demolished": sorted(transitions_demolished),
+                "demolitions": sorted(demolitions),
+            })
+        unscheduled = [
+            edit.id
+            for edit in self.edits
+            if isinstance(edit, (LinearWorkOp, JunctionAdjustmentOp))
+            and edit.id not in scheduled_ids
+            and edit.id not in transition_ids
+        ]
+        return {"stages": stages, "unscheduled_works": sorted(unscheduled)}
 
     def _affected_stored_chunks(self, edit) -> list[ChunkKey]:
         return [
@@ -178,6 +415,18 @@ class TerrainProject:
         removed = next((edit for edit in self.edits if edit.id == edit_id), None)
         if removed is None:
             raise EditError(f"edit not found: {edit_id}")
+        if isinstance(removed, TransitionOp):
+            raise EditError(
+                f"transition {edit_id} is a construction decision; "
+                "demolish it at a stage instead of undoing it"
+            )
+        if isinstance(removed, LinearWorkOp) and any(
+            entry.work_id == edit_id for entry in self.schedule
+        ):
+            raise EditError(
+                f"work {edit_id} has built portions; undo cannot roll back "
+                "completed terrain, schedule a demolition instead"
+            )
 
         affected_set = set(self._affected_stored_chunks(removed))
         voided = []
@@ -205,9 +454,14 @@ class TerrainProject:
             ]
         else:
             self.edits = [edit for edit in self.edits if edit.id != edit_id]
+        removed_ids = {edit_id, *(item["id"] for item in voided)}
+        self.schedule = [entry for entry in self.schedule if entry.work_id not in removed_ids]
+        self.demolitions = [
+            demolition for demolition in self.demolitions if demolition.work_id not in removed_ids
+        ]
         affected = sorted(affected_set, key=lambda key: (key.x, key.y))
         for key in affected:
-            grid = generate_grid(self.parameters, key, self.edits)
+            grid = generate_grid(self.parameters, key, self.final_edits())
             _atomic_write(self.chunk_dir / key.filename, grid)
         self.save_manifest()
         return {
@@ -277,12 +531,17 @@ def load_project(root: Path) -> TerrainProject:
     raw_edits = data.get("edits", [])
     raw_chunks = data.get("chunks", {})
     raw_voided = data.get("voided_edits", [])
+    raw_stages = data.get("stages", [])
+    raw_schedule = data.get("schedule", [])
+    raw_demolitions = data.get("demolitions", [])
     try:
         parameters = TerrainParameters.from_mapping(data["parameters"])
     except (ParameterError, KeyError, TypeError) as exc:
         raise ProjectError("invalid project manifest: " + str(exc)) from exc
 
     if not isinstance(raw_edits, list) or not isinstance(raw_chunks, dict) or not isinstance(raw_voided, list):
+        raise ProjectError("invalid project manifest")
+    if not isinstance(raw_stages, list) or not isinstance(raw_schedule, list) or not isinstance(raw_demolitions, list):
         raise ProjectError("invalid project manifest")
     edits = [edit_from_dict(value) for value in raw_edits]
     edit_ids = [edit.id for edit in edits]
@@ -320,4 +579,28 @@ def load_project(root: Path) -> TerrainProject:
     if not all(isinstance(item, dict) for item in raw_voided):
         raise ProjectError("invalid voided edit records")
 
-    return TerrainProject(root, parameters, edits, chunks, raw_voided)
+    try:
+        stages = [Stage.from_dict(value) for value in raw_stages]
+        schedule = [ScheduleEntry.from_dict(value) for value in raw_schedule]
+        demolitions = [Demolition.from_dict(value) for value in raw_demolitions]
+    except (EditError, TypeError, AttributeError) as exc:
+        raise ProjectError("invalid construction schedule: " + str(exc)) from exc
+    stage_ids = [stage.id for stage in stages]
+    if len(stage_ids) != len(set(stage_ids)):
+        raise ProjectError("stage ids must be unique")
+    known_ids = {edit.id for edit in edits}
+    for entry in schedule:
+        if entry.work_id not in known_ids:
+            raise ProjectError(f"schedule references missing work: {entry.work_id}")
+        if entry.stage not in stage_ids:
+            raise ProjectError(f"schedule references missing stage: {entry.stage}")
+    for demolition in demolitions:
+        if demolition.work_id not in known_ids:
+            raise ProjectError(f"demolition references missing work: {demolition.work_id}")
+        if demolition.stage not in stage_ids:
+            raise ProjectError(f"demolition references missing stage: {demolition.stage}")
+
+    return TerrainProject(
+        root, parameters, edits, chunks, raw_voided,
+        stages=stages, schedule=schedule, demolitions=demolitions,
+    )
