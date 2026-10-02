@@ -29,6 +29,13 @@ python -m terrain_system.cli road ./terrain_demo --x1 -50 --y1 50 --x2 250 --y2 
 python -m terrain_system.cli river ./terrain_demo --x1 0 --y1 -50 --x2 0 --y2 250 --width 10 --height -3 --shoulder 6 --priority 5
 python -m terrain_system.cli preview ./terrain_demo --kind road --x1 0 --y1 0 --x2 200 --y2 200 --width 12 --height 6 --priority 8
 python -m terrain_system.cli junction ./terrain_demo --work-a 2 --work-b 3 --x 0 --y 50 --radius 8 --height 5 --feather 3
+python -m terrain_system.cli construct ./terrain_demo --work 2 --start 0 --end 0.5
+python -m terrain_system.cli connect-preview ./terrain_demo --kind road --x1 0 --y1 0 --x2 200 --y2 200 --width 12 --height 6 --revises 2 --t 0.5
+python -m terrain_system.cli ramp ./terrain_demo --x1 90 --y1 90 --x2 110 --y2 110 --width 8 --height 6 --from-stage 1 --until-stage 1
+python -m terrain_system.cli construct-junction ./terrain_demo --junction 4 --stage 2
+python -m terrain_system.cli stage ./terrain_demo --number 1 --chunk 0,0
+python -m terrain_system.cli basis ./terrain_demo --junction 4 --x 0 --y 50
+python -m terrain_system.cli demolish ./terrain_demo --work 2 --start 0 --end 0.25
 python -m terrain_system.cli generate ./terrain_demo 2,0
 python -m terrain_system.cli stitch ./terrain_demo
 python -m terrain_system.cli undo ./terrain_demo --id 2
@@ -39,6 +46,14 @@ edit --delta 为正是抬高，为负是压低。road 把道路中心线半宽�
 道路（road）和河道（river）都是带显式 priority 的线性工程：交汇处由 priority 较大的工程保留自己的设计高度，priority 相同则由较小的编辑 ID 决定，因此结果与“谁后编辑”无关，也不受分块生成顺序或进程影响；编辑仍按 ID 固定重放。junction 是独立的第三次修订，只在以某点为中心的小半径区域内覆盖两个被引用工程的设计，feather 给出与周边平滑过渡的羽化宽度，半径之外的地形不变。
 
 preview 不写入工程，返回新线性工程会更新的已生成分块以及每个交汇点的坐标和保留/被覆盖的工程 ID。undo --id 只撤回这一次修订并重放其余编辑；省略 --id 时撤回最近一次编辑。撤回道路或河道时，引用它的 junction 修订会一并失效并在 undo 输出和 project.json 的 voided_edits 中给出原因，另一条工程（如河道）的修改完整保留；失效的 junction 不再作用于地形，重新补一条 junction 修订会使用新的最大 ID，旧 ID 不会被复用。
+
+## 分阶段施工
+
+道路和河道的几何与设计高度是设计修订；construction 记录的是施工决定，两者分开保存。`construct` 按中心线参数 0..1 只让一个区间在指定阶段生效，因此同一条道路可以先完成前半段，之后沿施工时间查看已完成永久面、尚未施工的原地形，以及临时通行面。分块 JSON 同时保存 `base_heights`、`permanent_heights`、`heights`、`temporary_deltas`、截至该阶段的 `construction_records` 和 `active_temporary_ramps`；重新打开工程或改变分块补生成顺序后，地形仍可与施工记录逐条对应。
+
+如果道路完成一半后修改剩余设计，新道路/河道可使用 `road --revises` 引用旧工程 ID。新设计只在自己的施工区间生效，旧设计的已施工区间继续保留；`connect-preview` 给出连接处的世界坐标、当前永久高度、新设计高度和高度差，可据此加入 `ramp` 临时过渡。临时过渡有 `active_from/active_until`，只在这些阶段的 `heights` 中生效，`permanent_heights` 不包含它；阶段结束后自动失效，不进入后续结果。
+
+`undo` 只能撤回尚未形成永久地形的设计修订；已经施工的道路或河道不能通过撤销回退，必须使用 `demolish` 记录一个新的拆除施工决定。junction 也可以用 `construct-junction` 指定生效阶段：跨阶段交汇高度采用该 junction 的显式记录阶段，`basis` 命令返回坐标、阶段、生效工程 ID 和最终采用依据（junction ID 或获胜工程 ID），不依赖生成或编辑顺序。
 
 ## 持久化和非法参数
 

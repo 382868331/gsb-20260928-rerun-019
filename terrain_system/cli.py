@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from .edits import EditError, EditOp, JunctionAdjustmentOp, LinearWorkOp, next_edit_id
+from .edits import EditError, EditOp, JunctionAdjustmentOp, LinearWorkOp, TemporaryRampOp, next_edit_id
 from .model import ChunkKey
 from .parameters import ParameterError, TerrainParameters
 from .project import ProjectError, create_project, load_project
@@ -79,6 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
         work.add_argument("--height", type=float, required=True)
         work.add_argument("--shoulder", type=_non_negative_float, default=0.0)
         work.add_argument("--priority", type=int, default=0, help="higher priority is retained at intersections")
+        work.add_argument("--revises", type=int, help="id of the work whose unbuilt design is being revised")
 
     add_work_parser("road", "flatten and smooth a road segment")
     add_work_parser("river", "cut and smooth a river channel segment")
@@ -115,6 +116,63 @@ def build_parser() -> argparse.ArgumentParser:
 
     info = subparsers.add_parser("info", help="show project metadata")
     info.add_argument("project", type=Path)
+
+    construct = subparsers.add_parser("construct", help="construct one longitudinal span of a work in the current stage")
+    construct.add_argument("project", type=Path)
+    construct.add_argument("--work", type=int, required=True)
+    construct.add_argument("--start", type=_non_negative_float, default=0.0)
+    construct.add_argument("--end", type=_positive_float, default=1.0)
+    construct.add_argument("--stage", type=int)
+
+    demolish = subparsers.add_parser("demolish", help="record demolition of completed terrain as a new construction decision")
+    demolish.add_argument("project", type=Path)
+    demolish.add_argument("--work", type=int, required=True)
+    demolish.add_argument("--start", type=_non_negative_float, default=0.0)
+    demolish.add_argument("--end", type=_positive_float, default=1.0)
+    demolish.add_argument("--stage", type=int)
+
+    ramp = subparsers.add_parser("ramp", help="add a temporary ramp valid for a stage range")
+    ramp.add_argument("project", type=Path)
+    ramp.add_argument("--x1", type=float, required=True)
+    ramp.add_argument("--y1", type=float, required=True)
+    ramp.add_argument("--x2", type=float, required=True)
+    ramp.add_argument("--y2", type=float, required=True)
+    ramp.add_argument("--width", type=_positive_float, required=True)
+    ramp.add_argument("--height", type=float, required=True)
+    ramp.add_argument("--shoulder", type=_non_negative_float, default=0.0)
+    ramp.add_argument("--from-stage", type=int, default=1)
+    ramp.add_argument("--until-stage", type=int, default=1)
+
+    construct_junction = subparsers.add_parser("construct-junction", help="activate a junction adjustment at a specific stage")
+    construct_junction.add_argument("project", type=Path)
+    construct_junction.add_argument("--junction", type=int, required=True)
+    construct_junction.add_argument("--stage", type=int)
+
+    stage = subparsers.add_parser("stage", help="advance stage or view permanent/temporary terrain at a stage")
+    stage.add_argument("project", type=Path)
+    stage.add_argument("--advance", action="store_true")
+    stage.add_argument("--number", type=int)
+    stage.add_argument("--chunk")
+
+    connect = subparsers.add_parser("connect-preview", help="preview height gap between a revised design and current terrain")
+    connect.add_argument("project", type=Path)
+    connect.add_argument("--kind", choices=("road", "river"), required=True)
+    connect.add_argument("--x1", type=float, required=True)
+    connect.add_argument("--y1", type=float, required=True)
+    connect.add_argument("--x2", type=float, required=True)
+    connect.add_argument("--y2", type=float, required=True)
+    connect.add_argument("--width", type=_positive_float, required=True)
+    connect.add_argument("--height", type=float, required=True)
+    connect.add_argument("--shoulder", type=_non_negative_float, default=0.0)
+    connect.add_argument("--priority", type=int, default=0)
+    connect.add_argument("--revises", type=int)
+    connect.add_argument("--t", type=_non_negative_float, default=0.0)
+
+    basis = subparsers.add_parser("basis", help="report the explicit adopted basis at a junction point")
+    basis.add_argument("project", type=Path)
+    basis.add_argument("--junction", type=int, required=True)
+    basis.add_argument("--x", type=float, required=True)
+    basis.add_argument("--y", type=float, required=True)
     return parser
 
 
@@ -175,6 +233,7 @@ def main(argv: list[str] | None = None) -> int:
                 height=args.height,
                 shoulder=args.shoulder,
                 priority=args.priority,
+                revises=args.revises,
             )
             affected = project.add_edit(edit)
             _print_json({
@@ -253,6 +312,77 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if not mismatches else 2
         elif args.command == "info":
             _print_json(project.to_dict())
+        elif args.command == "construct":
+            result = project.construct_work(args.work, args.start, args.end, args.stage)
+            _print_json({
+                "status": "constructed",
+                "record": result["record"].to_dict(),
+                "updated_chunks": [[key.x, key.y] for key in result["updated_chunks"]],
+            })
+        elif args.command == "demolish":
+            result = project.demolish_work(args.work, args.start, args.end, args.stage)
+            _print_json({
+                "status": "demolished",
+                "record": result["record"].to_dict(),
+                "updated_chunks": [[key.x, key.y] for key in result["updated_chunks"]],
+            })
+        elif args.command == "ramp":
+            edit = TemporaryRampOp(
+                id=next_edit_id(project.edits),
+                x1=args.x1,
+                y1=args.y1,
+                x2=args.x2,
+                y2=args.y2,
+                width=args.width,
+                height=args.height,
+                shoulder=args.shoulder,
+                active_from=args.from_stage,
+                active_until=args.until_stage,
+            )
+            affected = project.add_temporary_ramp(edit)
+            _print_json({
+                "status": "temporary_ramp",
+                "edit_id": edit.id,
+                "active_from": edit.active_from,
+                "active_until": edit.active_until,
+                "updated_chunks": [[key.x, key.y] for key in affected],
+            })
+        elif args.command == "construct-junction":
+            affected = project.construct_junction(args.junction, args.stage)
+            _print_json({
+                "status": "junction_constructed",
+                "junction": args.junction,
+                "stage": project.schedule.junction_stages[args.junction],
+                "updated_chunks": [[key.x, key.y] for key in affected],
+            })
+        elif args.command == "stage":
+            if args.advance:
+                project.advance_stage()
+                _print_json({"status": "advanced", "stage": project.schedule.current_stage})
+            elif args.chunk is not None:
+                if args.number is None:
+                    raise EditError("--number is required when viewing a chunk")
+                _print_json(project.surface_at_stage(ChunkKey.parse(args.chunk), args.number))
+            else:
+                _print_json({"status": "stage", "schedule": project.schedule.to_dict()})
+        elif args.command == "connect-preview":
+            candidate = LinearWorkOp(
+                id=next_edit_id(project.edits),
+                kind=args.kind,
+                x1=args.x1,
+                y1=args.y1,
+                x2=args.x2,
+                y2=args.y2,
+                width=args.width,
+                height=args.height,
+                shoulder=args.shoulder,
+                priority=args.priority,
+                revises=args.revises,
+            )
+            candidate.validate()
+            _print_json({"status": "connection_preview", **project.design_connection_preview(candidate, args.t)})
+        elif args.command == "basis":
+            _print_json({"status": "basis", **project.junction_height_basis(args.junction, args.x, args.y)})
         else:
             parser.error("unknown command")
     except (ParameterError, EditError, ProjectError, FileExistsError, FileNotFoundError, ValueError) as exc:

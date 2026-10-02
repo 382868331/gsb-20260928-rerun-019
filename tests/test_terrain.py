@@ -11,12 +11,28 @@ from terrain_system.edits import (
     EditOp,
     JunctionAdjustmentOp,
     LinearWorkOp,
+    TemporaryRampOp,
     apply_edits,
     next_edit_id,
 )
 from terrain_system.model import ChunkKey, generate_grid
 from terrain_system.parameters import ParameterError, TerrainParameters
 from terrain_system.project import create_project, load_project
+
+
+def _road(work_id: int, height: float = 4.0, revises=None):
+    return LinearWorkOp(
+        work_id,
+        "road",
+        -6.0,
+        0.0,
+        16.0,
+        0.0,
+        2.0,
+        height,
+        shoulder=1.0,
+        revises=revises,
+    )
 
 
 def params(resolution=5, chunk_size=10.0):
@@ -318,3 +334,95 @@ def test_generation_is_consistent_across_processes_order_reopen_and_local_recomp
     run("generate", str(first), "0,0")
     assert (first / "chunks" / "p0_p0.json").read_text() == edited
     run("stitch", str(first))
+
+
+def test_partial_construction_revision_keeps_completed_terrain(tmp_path: Path):
+    project = create_project(tmp_path, params())
+    project.generate_chunks([ChunkKey(0, 0)])
+    project.add_edit(_road(1, 4.0))
+    project.construct_work(1, 0.0, 0.5)
+
+    revised = _road(2, 8.0, revises=1)
+    project.add_edit(revised)
+    preview = project.design_connection_preview(revised, t=0.5)
+    assert preview["height_difference"] == pytest.approx(4.0)
+
+    result = project.undo_edit(2)
+    assert result["removed"].id == 2
+    still_built = project.load_chunk(ChunkKey(0, 0))
+    assert still_built["heights"] == project.surface_at_stage(ChunkKey(0, 0), 1)["heights"]
+
+
+def test_completed_work_requires_demolition_and_demolition_is_new_stage(tmp_path: Path):
+    project = create_project(tmp_path, params())
+    project.generate_chunks([ChunkKey(0, 0)])
+    project.add_edit(_road(1, 4.0))
+    project.construct_work(1, 0.0, 1.0)
+
+    with pytest.raises(Exception):
+        project.undo_edit(1)
+
+    built = project.surface_at_stage(ChunkKey(0, 0), 1)
+    project.demolish_work(1, 0.0, 1.0)
+    after = project.surface_at_stage(ChunkKey(0, 0), 2)
+    assert after["stage"] == 2
+    assert after["heights"][0][0] == built["base_heights"][0][0]
+
+
+def test_temporary_ramp_is_separate_and_expires_after_stage(tmp_path: Path):
+    project = create_project(tmp_path, params())
+    project.generate_chunks([ChunkKey(0, 0)])
+    project.add_edit(_road(1, 4.0))
+    project.construct_work(1, 0.0, 0.5)
+    ramp = TemporaryRampOp(2, 4.0, 5.0, 10.0, 5.0, 2.0, 7.0, 1.0, 1, 1)
+    project.add_temporary_ramp(ramp, stage=1)
+
+    active = project.surface_at_stage(ChunkKey(0, 0), 1)
+    assert active["heights"][2][-1] == 7.0
+    assert active["temporary_deltas"][2][-1] != 0.0
+    assert active["permanent_heights"][2][-1] != 7.0
+
+    expired = project.surface_at_stage(ChunkKey(0, 0), 2)
+    assert expired["heights"] == expired["permanent_heights"]
+    assert all(all(value == 0.0 for value in row) for row in expired["temporary_deltas"])
+
+
+def test_construction_records_survive_reopen_and_chunk_order(tmp_path: Path):
+    project = create_project(tmp_path, params())
+    project.generate_chunks([ChunkKey(1, 0), ChunkKey(0, 0)])
+    project.add_edit(_road(1, 4.0))
+    project.construct_work(1, 0.0, 0.5)
+    ramp = TemporaryRampOp(2, 4.0, 5.0, 10.0, 5.0, 2.0, 7.0, 1.0, 1, 1)
+    project.add_temporary_ramp(ramp, stage=1)
+    expected = project.surface_at_stage(ChunkKey(0, 0), 1)
+
+    reloaded = load_project(tmp_path)
+    reloaded.generate_chunks([ChunkKey(0, 0), ChunkKey(1, 0)])
+    actual = reloaded.surface_at_stage(ChunkKey(0, 0), 1)
+    assert actual["heights"] == expected["heights"]
+    assert reloaded.schedule.records[0].to_dict() == {
+        "work_id": 1,
+        "start": 0.0,
+        "end": 0.5,
+        "stage": 1,
+        "action": "build",
+    }
+
+
+def test_cross_stage_junction_has_explicit_height_basis(tmp_path: Path):
+    project = create_project(tmp_path, params())
+    project.generate_chunks([ChunkKey(0, 0)])
+    project.add_edit(LinearWorkOp(1, "road", -6.0, 0.0, 16.0, 0.0, 2.0, 4.0))
+    project.add_edit(LinearWorkOp(2, "river", 0.0, -6.0, 0.0, 16.0, 2.0, 7.0))
+    junction = JunctionAdjustmentOp(3, 1, 2, 0.0, 0.0, 1.5, 5.5)
+    project.add_edit(junction)
+    project.construct_work(1, 0.0, 1.0, stage=1)
+    project.construct_work(2, 0.0, 1.0, stage=2)
+    project.construct_junction(3, stage=2)
+
+    before = project.surface_at_stage(ChunkKey(0, 0), 1)
+    assert before["heights"][0][0] == 4.0
+    basis = project.junction_height_basis(3, 0.0, 0.0)
+    assert basis["height_basis"] == 3
+    assert basis["active_works"] == [1, 2]
+    assert basis["permanent_height"] == 5.5

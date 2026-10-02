@@ -6,13 +6,16 @@ import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
+from .construction import BuiltSpan, ConstructionSchedule, construction_basis, permanent_height
 from .edits import (
+    EditOp,
     JunctionAdjustmentOp,
     LinearWorkOp,
+    TemporaryRampOp,
     edit_from_dict,
     next_edit_id,
 )
-from .model import ChunkKey, chunk_affected_by_edit, generate_grid, validate_chunk_key
+from .model import ChunkKey, base_height_at, chunk_affected_by_edit, generate_grid, validate_chunk_key
 from .parameters import ParameterError, TerrainParameters
 from .stitch import check_seams
 
@@ -76,12 +79,14 @@ class TerrainProject:
         edits: list,
         chunks: dict[str, str],
         voided_edits: list[dict] | None = None,
+        schedule: ConstructionSchedule | None = None,
     ):
         self.root = root
         self.parameters = parameters
         self.edits = sorted(edits, key=lambda edit: edit.id)
         self.chunks = dict(chunks)
         self.voided_edits = list(voided_edits or [])
+        self.schedule = schedule or ConstructionSchedule()
 
     @property
     def chunk_dir(self) -> Path:
@@ -94,6 +99,7 @@ class TerrainProject:
             "edits": [edit.to_dict() for edit in self.edits],
             "chunks": dict(sorted(self.chunks.items())),
             "voided_edits": list(self.voided_edits),
+            "construction": self.schedule.to_dict(),
         }
 
     def linear_works(self) -> list[LinearWorkOp]:
@@ -104,7 +110,7 @@ class TerrainProject:
 
     def save_chunk(self, key: ChunkKey) -> dict:
         validate_chunk_key(key)
-        grid = generate_grid(self.parameters, key, self.edits)
+        grid = generate_grid(self.parameters, key, self.edits, self.schedule)
         chunk_path = self.chunk_dir / key.filename
         _atomic_write(chunk_path, grid)
         self.chunks[str(key)] = CHUNK_DIR + "/" + key.filename
@@ -153,6 +159,9 @@ class TerrainProject:
             raise EditError("edit id must be the next sequential id")
         if isinstance(edit, JunctionAdjustmentOp):
             self._validate_junction_references(edit)
+        if isinstance(edit, LinearWorkOp) and edit.revises is not None:
+            if edit.revises == edit.id or edit.revises not in {work.id for work in self.linear_works()}:
+                raise ProjectError(f"revision references missing work: {edit.revises}")
         self.edits.append(edit)
 
         affected = []
@@ -162,7 +171,7 @@ class TerrainProject:
                 affected.append(key)
 
         for key in affected:
-            grid = generate_grid(self.parameters, key, self.edits)
+            grid = generate_grid(self.parameters, key, self.edits, self.schedule)
             _atomic_write(self.chunk_dir / key.filename, grid)
         self.save_manifest()
         return affected
@@ -178,6 +187,16 @@ class TerrainProject:
         removed = next((edit for edit in self.edits if edit.id == edit_id), None)
         if removed is None:
             raise EditError(f"edit not found: {edit_id}")
+        if isinstance(removed, LinearWorkOp) and self.schedule.active_intervals(removed.id, self.schedule.current_stage):
+            raise ProjectError(
+                f"{removed.kind} {removed.id} has completed terrain; demolish it as a new construction decision"
+            )
+        if isinstance(removed, JunctionAdjustmentOp) and removed.id in self.schedule.junction_stages:
+            raise ProjectError("constructed junction cannot be rolled back; add a new revision instead")
+        if isinstance(removed, LinearWorkOp) and any(
+            isinstance(edit, LinearWorkOp) and edit.revises == removed.id for edit in self.edits
+        ):
+            raise ProjectError("undo the newer design revision before removing its referenced work")
 
         affected_set = set(self._affected_stored_chunks(removed))
         voided = []
@@ -207,7 +226,7 @@ class TerrainProject:
             self.edits = [edit for edit in self.edits if edit.id != edit_id]
         affected = sorted(affected_set, key=lambda key: (key.x, key.y))
         for key in affected:
-            grid = generate_grid(self.parameters, key, self.edits)
+            grid = generate_grid(self.parameters, key, self.edits, self.schedule)
             _atomic_write(self.chunk_dir / key.filename, grid)
         self.save_manifest()
         return {
@@ -215,6 +234,149 @@ class TerrainProject:
             "updated_chunks": affected,
             "voided_edits": voided,
         }
+
+    def _work(self, work_id: int) -> LinearWorkOp:
+        work = next((item for item in self.linear_works() if item.id == work_id), None)
+        if work is None:
+            raise ProjectError(f"work not found: {work_id}")
+        return work
+
+    def _schedule_ready(self) -> None:
+        if not self.schedule.enabled:
+            self.schedule.current_stage = max(self.schedule.current_stage, 1)
+
+    def _refresh_schedule_chunks(self, affected: list[ChunkKey]) -> None:
+        for key in affected:
+            grid = generate_grid(self.parameters, key, self.edits, self.schedule)
+            _atomic_write(self.chunk_dir / key.filename, grid)
+        self.save_manifest()
+
+    def construct_work(
+        self,
+        work_id: int,
+        start: float,
+        end: float,
+        stage: int | None = None,
+    ) -> dict:
+        work = self._work(work_id)
+        if not 0.0 <= start <= end <= 1.0:
+            raise EditError("construction bounds must satisfy 0 <= start <= end <= 1")
+        self._schedule_ready()
+        stage = self.schedule.current_stage if stage is None else stage
+        if stage < 1 or stage < self.schedule.current_stage:
+            raise EditError("cannot insert a construction stage in the past")
+        record = BuiltSpan(work_id, start, end, stage, "build")
+        self.schedule.add_record(record)
+        affected = self._affected_stored_chunks(work)
+        self._refresh_schedule_chunks(affected)
+        return {"record": record, "updated_chunks": affected}
+
+    def demolish_work(self, work_id: int, start: float, end: float, stage: int | None = None) -> dict:
+        work = self._work(work_id)
+        if not 0.0 <= start <= end <= 1.0:
+            raise EditError("demolition bounds must satisfy 0 <= start <= end <= 1")
+        self._schedule_ready()
+        stage = self.schedule.current_stage + 1 if stage is None else stage
+        if stage < self.schedule.current_stage:
+            raise EditError("cannot record demolition in a past stage")
+        record = BuiltSpan(work_id, start, end, stage, "demolish")
+        self.schedule.add_record(record)
+        affected = self._affected_stored_chunks(work)
+        self._refresh_schedule_chunks(affected)
+        return {"record": record, "updated_chunks": affected}
+
+    def add_temporary_ramp(self, ramp: TemporaryRampOp, stage: int | None = None) -> list[ChunkKey]:
+        ramp.validate()
+        if ramp.id <= 0 or ramp.id in {stored.id for stored in self.edits}:
+            raise EditError("ramp id must be the next sequential id")
+        self._schedule_ready()
+        if ramp.active_from < self.schedule.current_stage:
+            raise EditError("temporary ramp cannot begin in a past stage")
+        self.edits.append(ramp)
+        self.schedule.current_stage = max(self.schedule.current_stage, ramp.active_from)
+        affected = self._affected_stored_chunks(ramp)
+        self._refresh_schedule_chunks(affected)
+        return affected
+
+    def construct_junction(self, junction_id: int, stage: int | None = None) -> list[ChunkKey]:
+        junction = next((item for item in self.edits if isinstance(item, JunctionAdjustmentOp) and item.id == junction_id), None)
+        if junction is None:
+            raise ProjectError(f"junction not found: {junction_id}")
+        self._schedule_ready()
+        stage = self.schedule.current_stage if stage is None else stage
+        if stage < self.schedule.current_stage:
+            raise EditError("cannot construct a junction in a past stage")
+        self.schedule.junction_stages[junction.id] = stage
+        self.schedule.current_stage = max(self.schedule.current_stage, stage)
+        affected = self._affected_stored_chunks(junction)
+        self._refresh_schedule_chunks(affected)
+        return affected
+
+    def advance_stage(self) -> None:
+        self._schedule_ready()
+        self.schedule.current_stage += 1
+        affected = [ChunkKey.parse(key) for key in sorted(self.chunks)]
+        self._refresh_schedule_chunks(affected)
+
+    def surface_at_stage(self, key: ChunkKey, stage: int) -> dict:
+        validate_chunk_key(key)
+        if stage < 0:
+            raise EditError("stage must be non-negative")
+        grid = generate_grid(self.parameters, key, self.edits, self.schedule, stage)
+        return {
+            "chunk": [key.x, key.y],
+            "stage": stage,
+            "base_heights": grid["base_heights"],
+            "permanent_heights": grid["permanent_heights"],
+            "temporary_deltas": grid["temporary_deltas"],
+            "heights": grid["heights"],
+            "construction_records": grid["construction_records"],
+            "active_temporary_ramps": grid["active_temporary_ramps"],
+        }
+
+    def design_connection_preview(self, candidate: LinearWorkOp, t: float = 0.0) -> dict:
+        candidate.validate()
+        x, y = candidate.point_at(t)
+        works = [*self.linear_works(), candidate]
+        stage = self.schedule.current_stage
+        current_height = self._non_linear_height(x, y)
+        current_height, _ = permanent_height(
+            current_height,
+            x,
+            y,
+            self.linear_works(),
+            [item for item in self.edits if isinstance(item, JunctionAdjustmentOp)],
+            self.schedule,
+            stage,
+        )
+        return {
+            "point": [x, y],
+            "stage": stage,
+            "current_permanent_height": current_height,
+            "new_design_height": candidate.height,
+            "height_difference": candidate.height - current_height,
+            "revises": candidate.revises,
+        }
+
+    def junction_height_basis(self, junction_id: int, x: float, y: float) -> dict:
+        junction = next((item for item in self.edits if isinstance(item, JunctionAdjustmentOp) and item.id == junction_id), None)
+        if junction is None:
+            raise ProjectError(f"junction not found: {junction_id}")
+        works = self.linear_works()
+        junctions = [item for item in self.edits if isinstance(item, JunctionAdjustmentOp)]
+        stage = self.schedule.junction_stages.get(junction.id, self.schedule.current_stage)
+        basis = construction_basis(x, y, works, junctions, self.schedule, stage)
+        height, _ = permanent_height(
+            self._non_linear_height(x, y), x, y, works, junctions, self.schedule, stage
+        )
+        return {**basis, "permanent_height": height}
+
+    def _non_linear_height(self, x: float, y: float) -> float:
+        height = base_height_at(self.parameters, x, y)
+        for edit in self.edits:
+            if isinstance(edit, EditOp):
+                height += edit.displacement_at(x, y)
+        return height
 
     def revision_summary(self, edit: LinearWorkOp) -> dict:
         affected = [
@@ -277,6 +439,7 @@ def load_project(root: Path) -> TerrainProject:
     raw_edits = data.get("edits", [])
     raw_chunks = data.get("chunks", {})
     raw_voided = data.get("voided_edits", [])
+    schedule = ConstructionSchedule.from_dict(data.get("construction"))
     try:
         parameters = TerrainParameters.from_mapping(data["parameters"])
     except (ParameterError, KeyError, TypeError) as exc:
@@ -319,5 +482,18 @@ def load_project(root: Path) -> TerrainProject:
 
     if not all(isinstance(item, dict) for item in raw_voided):
         raise ProjectError("invalid voided edit records")
+    work_ids = {edit.id for edit in edits if isinstance(edit, LinearWorkOp)}
+    missing_records = sorted({record.work_id for record in schedule.records if record.work_id not in work_ids})
+    if missing_records:
+        raise ProjectError(
+            "construction records reference missing work(s): " + ", ".join(str(value) for value in missing_records)
+        )
+    junction_ids = {edit.id for edit in edits if isinstance(edit, JunctionAdjustmentOp)}
+    missing_junctions = sorted(set(schedule.junction_stages) - junction_ids)
+    if missing_junctions:
+        raise ProjectError(
+            "construction records reference missing junction(s): "
+            + ", ".join(str(value) for value in missing_junctions)
+        )
 
-    return TerrainProject(root, parameters, edits, chunks, raw_voided)
+    return TerrainProject(root, parameters, edits, chunks, raw_voided, schedule)

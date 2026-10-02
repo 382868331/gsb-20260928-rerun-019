@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .edits import JunctionAdjustmentOp, LinearWorkOp, apply_edits
+from .construction import ConstructionSchedule, permanent_height, temporary_height
+from .edits import JunctionAdjustmentOp, LinearWorkOp, TemporaryRampOp, resolve_linear_height, split_all_edits
 from .noise import terrain_height
 from .parameters import TerrainParameters
 
@@ -56,27 +57,67 @@ def base_height_at(params: TerrainParameters, x: float, y: float) -> float:
     )
 
 
-def generate_grid(params: TerrainParameters, key: ChunkKey, edits: list) -> dict:
+def _apply_design_at(
+    generated: float,
+    x: float,
+    y: float,
+    brushes,
+    works,
+    junctions,
+    ramps,
+    schedule: ConstructionSchedule | None,
+    stage: int,
+) -> tuple[float, float, float]:
+    height = generated
+    for brush in sorted(brushes, key=lambda edit: edit.id):
+        height += brush.displacement_at(x, y)
+    if schedule is None or not schedule.enabled:
+        permanent = resolve_linear_height(height, x, y, sorted(works, key=lambda edit: edit.id), sorted(junctions, key=lambda edit: edit.id))
+        return permanent, permanent, 0.0
+    permanent, _ = permanent_height(height, x, y, works, junctions, schedule, stage)
+    staged, active_ramps = temporary_height(permanent, x, y, ramps, stage)
+    return permanent, staged, staged - permanent if active_ramps else 0.0
+
+
+def generate_grid(
+    params: TerrainParameters,
+    key: ChunkKey,
+    edits: list,
+    schedule: ConstructionSchedule | None = None,
+    stage: int | None = None,
+) -> dict:
     validate_chunk_key(key)
     ordered_edits = sorted(edits, key=lambda edit: edit.id)
+    brushes, works, junctions, ramps = split_all_edits(ordered_edits)
+    active_stage = stage if stage is not None else (schedule.current_stage if schedule is not None else 0)
     base = []
     heights = []
+    staged_heights = []
+    temporary_deltas = []
     min_height = float("inf")
     max_height = float("-inf")
 
     for row in range(params.resolution):
         base_row = []
         height_row = []
+        staged_row = []
+        temporary_row = []
         for column in range(params.resolution):
             x, y = world_point(params, key, column, row)
             generated = base_height_at(params, x, y)
-            height = apply_edits(generated, x, y, ordered_edits)
+            permanent, staged, temporary_delta = _apply_design_at(
+                generated, x, y, brushes, works, junctions, ramps, schedule, active_stage
+            )
             base_row.append(generated)
-            height_row.append(height)
-            min_height = min(min_height, height)
-            max_height = max(max_height, height)
+            height_row.append(permanent)
+            staged_row.append(staged)
+            temporary_row.append(temporary_delta)
+            min_height = min(min_height, staged)
+            max_height = max(max_height, staged)
         base.append(base_row)
         heights.append(height_row)
+        staged_heights.append(staged_row)
+        temporary_deltas.append(temporary_row)
 
     return {
         "version": 1,
@@ -88,7 +129,20 @@ def generate_grid(params: TerrainParameters, key: ChunkKey, edits: list) -> dict
         "resolution": params.resolution,
         "cell_size": params.chunk_size / (params.resolution - 1),
         "base_heights": base,
-        "heights": heights,
+        "permanent_heights": heights,
+        "heights": staged_heights if schedule is not None and schedule.enabled else heights,
+        "temporary_deltas": temporary_deltas,
+        "stage": active_stage if schedule is not None and schedule.enabled else None,
+        "construction_records": [
+            record.to_dict()
+            for record in (schedule.records if schedule is not None else [])
+            if record.stage <= active_stage
+        ] if schedule is not None and schedule.enabled else [],
+        "active_temporary_ramps": [
+            ramp.id
+            for ramp in ramps
+            if ramp.active_at_stage(active_stage)
+        ] if schedule is not None and schedule.enabled else [],
         "min_height": min_height,
         "max_height": max_height,
     }
@@ -99,7 +153,7 @@ def chunk_affected_by_edit(params: TerrainParameters, key: ChunkKey, edit) -> bo
     min_y = key.y * params.chunk_size
     max_x = min_x + params.chunk_size
     max_y = min_y + params.chunk_size
-    if isinstance(edit, (LinearWorkOp, JunctionAdjustmentOp)):
+    if isinstance(edit, (LinearWorkOp, JunctionAdjustmentOp, TemporaryRampOp)):
         radius = edit.influence_radius()
         if isinstance(edit, JunctionAdjustmentOp):
             nearest_x = min(max(edit.x, min_x), max_x)

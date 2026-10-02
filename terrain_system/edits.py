@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 from typing import Any
 
@@ -103,6 +103,7 @@ class LinearWorkOp:
     height: float
     shoulder: float = 0.0
     priority: int = 0
+    revises: int | None = None
 
     @property
     def type_name(self) -> str:
@@ -114,6 +115,12 @@ class LinearWorkOp:
             raise EditError("kind must be one of: " + ", ".join(WORK_KINDS))
         if not isinstance(self.priority, int) or isinstance(self.priority, bool):
             raise EditError("priority must be an integer")
+        if self.revises is not None and (
+            not isinstance(self.revises, int)
+            or isinstance(self.revises, bool)
+            or self.revises < 1
+        ):
+            raise EditError("revises must reference a positive work id")
         for name in ("x1", "y1", "x2", "y2", "width", "height", "shoulder"):
             _validate_number(getattr(self, name), name)
         if self.width <= 0:
@@ -136,6 +143,7 @@ class LinearWorkOp:
             "height": self.height,
             "shoulder": self.shoulder,
             "priority": self.priority,
+            "revises": self.revises,
         }
 
     @staticmethod
@@ -155,6 +163,7 @@ class LinearWorkOp:
                 height=data["height"],
                 shoulder=data.get("shoulder", 0.0),
                 priority=data.get("priority", 0),
+                revises=data.get("revises"),
             )
         except KeyError as exc:
             raise EditError(f"missing edit field: {exc.args[0]}") from exc
@@ -185,6 +194,21 @@ class LinearWorkOp:
 
     def influence_radius(self) -> float:
         return self.width / 2.0 + self.shoulder
+
+    def projection_at(self, x: float, y: float) -> float:
+        dx = self.x2 - self.x1
+        dy = self.y2 - self.y1
+        length_squared = dx * dx + dy * dy
+        return ((x - self.x1) * dx + (y - self.y1) * dy) / length_squared
+
+    def longitudinal_weight_at(self, x: float, y: float, start: float, end: float) -> float:
+        projection = min(max(self.projection_at(x, y), 0.0), 1.0)
+        if projection < start or projection > end:
+            return 0.0
+        return self.core_weight_at(x, y)
+
+    def point_at(self, t: float) -> tuple[float, float]:
+        return self.x1 + t * (self.x2 - self.x1), self.y1 + t * (self.y2 - self.y1)
 
 
 @dataclass(frozen=True)
@@ -276,6 +300,104 @@ AnyEdit = "EditOp | LinearWorkOp | JunctionAdjustmentOp"
 RevisionOp = "LinearWorkOp | JunctionAdjustmentOp"
 
 
+@dataclass(frozen=True)
+class TemporaryRampOp:
+    """A temporary driving surface valid only for an explicit stage range."""
+
+    id: int
+    x1: float
+    y1: float
+    x2: float
+    y2: float
+    width: float
+    height: float
+    shoulder: float = 0.0
+    active_from: int = 1
+    active_until: int = 1
+
+    @property
+    def type_name(self) -> str:
+        return "temporary_ramp"
+
+    def validate(self) -> None:
+        _validate_id(self.id)
+        for name in ("x1", "y1", "x2", "y2", "width", "height", "shoulder"):
+            _validate_number(getattr(self, name), name)
+        for name in ("active_from", "active_until"):
+            value = getattr(self, name)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise EditError(f"{name} must be a positive stage number")
+        if self.width <= 0:
+            raise EditError("width must be positive")
+        if self.shoulder < 0:
+            raise EditError("shoulder must be non-negative")
+        if self.active_until < self.active_from:
+            raise EditError("active_until must not precede active_from")
+        if math.hypot(self.x2 - self.x1, self.y2 - self.y1) == 0.0:
+            raise EditError("ramp endpoints must not be identical")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "type": "temporary_ramp",
+            "id": self.id,
+            "x1": self.x1,
+            "y1": self.y1,
+            "x2": self.x2,
+            "y2": self.y2,
+            "width": self.width,
+            "height": self.height,
+            "shoulder": self.shoulder,
+            "active_from": self.active_from,
+            "active_until": self.active_until,
+        }
+
+    @staticmethod
+    def from_dict(data: dict[str, Any]) -> "TemporaryRampOp":
+        try:
+            op = TemporaryRampOp(
+                id=data["id"],
+                x1=data["x1"],
+                y1=data["y1"],
+                x2=data["x2"],
+                y2=data["y2"],
+                width=data["width"],
+                height=data["height"],
+                shoulder=data.get("shoulder", 0.0),
+                active_from=data.get("active_from", 1),
+                active_until=data.get("active_until", 1),
+            )
+        except KeyError as exc:
+            raise EditError(f"missing edit field: {exc.args[0]}") from exc
+        op.validate()
+        return op
+
+    def core_weight_at(self, x: float, y: float) -> float:
+        distance = self._distance(x, y)
+        inner = self.width / 2.0
+        outer = inner + self.shoulder
+        if distance >= outer:
+            return 0.0
+        if distance <= inner or self.shoulder == 0.0:
+            return 1.0
+        t = (distance - inner) / self.shoulder
+        smooth = t * t * (3.0 - 2.0 * t)
+        return 1.0 - smooth
+
+    def _distance(self, x: float, y: float) -> float:
+        dx = self.x2 - self.x1
+        dy = self.y2 - self.y1
+        length_squared = dx * dx + dy * dy
+        projection = ((x - self.x1) * dx + (y - self.y1) * dy) / length_squared
+        projection = min(max(projection, 0.0), 1.0)
+        return math.hypot(x - (self.x1 + projection * dx), y - (self.y1 + projection * dy))
+
+    def influence_radius(self) -> float:
+        return self.width / 2.0 + self.shoulder
+
+    def active_at_stage(self, stage: int) -> bool:
+        return self.active_from <= stage <= self.active_until
+
+
 def split_edits(edits: list[AnyEdit]) -> tuple[list[EditOp], list[LinearWorkOp], list[JunctionAdjustmentOp]]:
     brushes = []
     works = []
@@ -288,6 +410,13 @@ def split_edits(edits: list[AnyEdit]) -> tuple[list[EditOp], list[LinearWorkOp],
         else:
             brushes.append(edit)
     return brushes, works, junctions
+
+
+def split_all_edits(edits: list) -> tuple[list[EditOp], list[LinearWorkOp], list[JunctionAdjustmentOp], list[TemporaryRampOp]]:
+    ramps = [edit for edit in edits if isinstance(edit, TemporaryRampOp)]
+    without_ramps = [edit for edit in edits if not isinstance(edit, TemporaryRampOp)]
+    brushes, works, junctions = split_edits(without_ramps)
+    return brushes, works, junctions, ramps
 
 
 def linear_work_rank(work: LinearWorkOp) -> tuple[int, int]:
@@ -351,4 +480,6 @@ def edit_from_dict(data: dict[str, Any]) -> AnyEdit:
         return LinearWorkOp.from_dict(data)
     if edit_type == "junction":
         return JunctionAdjustmentOp.from_dict(data)
+    if edit_type == "temporary_ramp":
+        return TemporaryRampOp.from_dict(data)
     raise EditError(f"unknown edit type: {edit_type}")
