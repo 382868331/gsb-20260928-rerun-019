@@ -42,6 +42,7 @@ def _finite_float(value: str) -> float:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="terrain", description="Deterministic chunked height terrain")
     subparsers = parser.add_subparsers(dest="command", required=True)
+    _add_earthwork_parsers(subparsers)
 
     init = subparsers.add_parser("init", help="create a terrain project")
     init.add_argument("path", type=Path)
@@ -174,6 +175,69 @@ def build_parser() -> argparse.ArgumentParser:
     basis.add_argument("--x", type=float, required=True)
     basis.add_argument("--y", type=float, required=True)
     return parser
+
+
+def _add_earthwork_parsers(subparsers) -> None:
+    supply = subparsers.add_parser("earth-supply", help="record explicit external make-up material")
+    supply.add_argument("project", type=Path)
+    supply.add_argument("--quantity", type=float, required=True)
+    supply.add_argument("--stage", type=int)
+    supply.add_argument("--note", default="")
+
+    loss = subparsers.add_parser("earth-loss", help="record explicit disposal/loss from a batch")
+    loss.add_argument("project", type=Path)
+    loss.add_argument("--batch", required=True)
+    loss.add_argument("--quantity", type=float, required=True)
+    loss.add_argument("--stage", type=int)
+    loss.add_argument("--note", default="")
+
+    reserve = subparsers.add_parser("earth-reserve", help="reserve batch soil for a future fill target")
+    reserve.add_argument("project", type=Path)
+    reserve.add_argument("--batch", required=True)
+    reserve.add_argument("--target", required=True)
+    reserve.add_argument("--quantity", type=float, required=True)
+    reserve.add_argument("--stage", type=int)
+    reserve.add_argument("--work", type=int)
+    reserve.add_argument("--start", type=float)
+    reserve.add_argument("--end", type=float)
+
+    arrive = subparsers.add_parser("earth-arrive", help="record arrival of reserved soil")
+    arrive.add_argument("project", type=Path)
+    arrive.add_argument("--reservation", required=True)
+    arrive.add_argument("--stage", type=int)
+    arrive.add_argument("--quantity", type=float)
+
+    place = subparsers.add_parser("earth-place", help="place arrived or free material into a fill target")
+    place.add_argument("project", type=Path)
+    place.add_argument("--target", required=True)
+    place.add_argument("--quantity", type=float, required=True)
+    place.add_argument("--stage", type=int)
+    place.add_argument("--reservation")
+    place.add_argument("--batch")
+    place.add_argument("--work", type=int)
+    place.add_argument("--start", type=float)
+    place.add_argument("--end", type=float)
+
+    cancel = subparsers.add_parser("earth-cancel", help="cancel an un-arrived reservation")
+    cancel.add_argument("project", type=Path)
+    cancel.add_argument("--reservation", required=True)
+    cancel.add_argument("--reason", required=True)
+    cancel.add_argument("--stage", type=int)
+
+    balance = subparsers.add_parser("earth-balance", help="show batch and reservation balances at a stage")
+    balance.add_argument("project", type=Path)
+    balance.add_argument("--stage", type=int)
+
+    trace = subparsers.add_parser("earth-trace", help="trace final fill back to source cut/recovery/supply")
+    trace.add_argument("project", type=Path)
+    trace.add_argument("--target", required=True)
+    trace.add_argument("--stage", type=int)
+
+    plan = subparsers.add_parser("earth-plan", help="compare stockpile reuse vs external supply")
+    plan.add_argument("project", type=Path)
+    plan.add_argument("--work", type=int, required=True)
+    plan.add_argument("--span", action="append", default=[],
+                       help="stage:start:end, may be repeated")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -318,6 +382,9 @@ def main(argv: list[str] | None = None) -> int:
                 "status": "constructed",
                 "record": result["record"].to_dict(),
                 "updated_chunks": [[key.x, key.y] for key in result["updated_chunks"]],
+                "cut_volume": result["cut_volume"],
+                "fill_volume": result["fill_volume"],
+                "earthwork": result["earthwork"],
             })
         elif args.command == "demolish":
             result = project.demolish_work(args.work, args.start, args.end, args.stage)
@@ -325,6 +392,9 @@ def main(argv: list[str] | None = None) -> int:
                 "status": "demolished",
                 "record": result["record"].to_dict(),
                 "updated_chunks": [[key.x, key.y] for key in result["updated_chunks"]],
+                "cut_volume": result["cut_volume"],
+                "fill_volume": result["fill_volume"],
+                "earthwork": result["earthwork"],
             })
         elif args.command == "ramp":
             edit = TemporaryRampOp(
@@ -383,6 +453,44 @@ def main(argv: list[str] | None = None) -> int:
             _print_json({"status": "connection_preview", **project.design_connection_preview(candidate, args.t)})
         elif args.command == "basis":
             _print_json({"status": "basis", **project.junction_height_basis(args.junction, args.x, args.y)})
+        elif args.command == "earth-supply":
+            result = project.earth_supply(args.quantity, args.stage, args.note)
+            _print_json({"status": "supplied", **result})
+        elif args.command == "earth-loss":
+            result = project.earth_loss(args.batch, args.quantity, args.stage, args.note)
+            _print_json({"status": "loss_recorded", **result})
+        elif args.command == "earth-reserve":
+            result = project.earth_reserve(
+                args.batch, args.target, args.quantity, args.stage,
+                work_id=args.work, start=args.start, end=args.end,
+            )
+            _print_json({"status": "reserved", **result})
+        elif args.command == "earth-arrive":
+            result = project.earth_arrive(args.reservation, args.stage, args.quantity)
+            _print_json({"status": "arrived", **result})
+        elif args.command == "earth-place":
+            result = project.earth_place(
+                args.target, args.quantity, args.stage,
+                reservation_id=args.reservation, batch=args.batch,
+                work_id=args.work, start=args.start, end=args.end,
+            )
+            _print_json({"status": "placed", **result})
+        elif args.command == "earth-cancel":
+            result = project.earth_cancel_reservation(args.reservation, args.reason, args.stage)
+            _print_json({"status": "cancelled", **result})
+        elif args.command == "earth-balance":
+            _print_json({"status": "earth_balance", **project.earth_balances(args.stage)})
+        elif args.command == "earth-trace":
+            _print_json({"status": "earth_trace", **project.earth_trace(args.target, args.stage)})
+        elif args.command == "earth-plan":
+            spans = []
+            for value in args.span:
+                parts = value.split(":")
+                if len(parts) != 3:
+                    raise EditError("--span must be stage:start:end")
+                spans.append({"stage": int(parts[0]), "start": float(parts[1]), "end": float(parts[2])})
+            _print_json({"status": "earth_plan",
+                         **project.compare_completion_strategies(args.work, spans)})
         else:
             parser.error("unknown command")
     except (ParameterError, EditError, ProjectError, FileExistsError, FileNotFoundError, ValueError) as exc:
