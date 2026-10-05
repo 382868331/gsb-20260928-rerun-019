@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from .construction import BuiltSpan, ConstructionSchedule, construction_basis, permanent_height
+from .earthwork import surface_volume_change
 from .edits import (
     EditOp,
     JunctionAdjustmentOp,
@@ -18,6 +19,7 @@ from .edits import (
 from .model import ChunkKey, base_height_at, chunk_affected_by_edit, generate_grid, validate_chunk_key
 from .parameters import ParameterError, TerrainParameters
 from .stitch import check_seams
+from .materials import MaterialLedger
 
 
 PROJECT_FILE = "project.json"
@@ -80,6 +82,7 @@ class TerrainProject:
         chunks: dict[str, str],
         voided_edits: list[dict] | None = None,
         schedule: ConstructionSchedule | None = None,
+        materials: MaterialLedger | None = None,
     ):
         self.root = root
         self.parameters = parameters
@@ -87,6 +90,7 @@ class TerrainProject:
         self.chunks = dict(chunks)
         self.voided_edits = list(voided_edits or [])
         self.schedule = schedule or ConstructionSchedule()
+        self.materials = materials or MaterialLedger()
 
     @property
     def chunk_dir(self) -> Path:
@@ -100,6 +104,7 @@ class TerrainProject:
             "chunks": dict(sorted(self.chunks.items())),
             "voided_edits": list(self.voided_edits),
             "construction": self.schedule.to_dict(),
+            "materials": self.materials.to_dict(),
         }
 
     def linear_works(self) -> list[LinearWorkOp]:
@@ -251,6 +256,34 @@ class TerrainProject:
             _atomic_write(self.chunk_dir / key.filename, grid)
         self.save_manifest()
 
+    def _record_stage_earthwork(
+        self,
+        affected: list[ChunkKey],
+        stage: int,
+        trigger: str,
+        before_chunks: dict[tuple[int, int], dict] | None = None,
+    ) -> dict | None:
+        if not affected:
+            return None
+        before = before_chunks or {
+            (key.x, key.y): generate_grid(
+                self.parameters, key, self.edits, self.schedule, max(0, stage - 1)
+            )
+            for key in affected
+        }
+        after = {(key.x, key.y): self.load_chunk(key) for key in affected}
+        change = surface_volume_change(
+            before,
+            after,
+            self.parameters.chunk_size / (self.parameters.resolution - 1),
+        )
+        change = {
+            key: (0.0 if value < 1e-12 else value)
+            for key, value in change.items()
+        }
+        event = self.materials.record_earthwork(stage, trigger, change["cut"], change["fill"])
+        return {"event": event.to_dict(), **change}
+
     def construct_work(
         self,
         work_id: int,
@@ -265,11 +298,17 @@ class TerrainProject:
         stage = self.schedule.current_stage if stage is None else stage
         if stage < 1 or stage < self.schedule.current_stage:
             raise EditError("cannot insert a construction stage in the past")
-        record = BuiltSpan(work_id, start, end, stage, "build")
-        self.schedule.add_record(record)
         affected = self._affected_stored_chunks(work)
+        record = BuiltSpan(work_id, start, end, stage, "build")
+        before_chunks = {
+            (key.x, key.y): generate_grid(self.parameters, key, self.edits, self.schedule, stage)
+            for key in affected
+        }
+        self.schedule.add_record(record)
         self._refresh_schedule_chunks(affected)
-        return {"record": record, "updated_chunks": affected}
+        earthwork = self._record_stage_earthwork(affected, stage, f"construct-work-{work_id}", before_chunks)
+        self.save_manifest()
+        return {"record": record, "updated_chunks": affected, "earthwork": earthwork}
 
     def demolish_work(self, work_id: int, start: float, end: float, stage: int | None = None) -> dict:
         work = self._work(work_id)
@@ -279,11 +318,17 @@ class TerrainProject:
         stage = self.schedule.current_stage + 1 if stage is None else stage
         if stage < self.schedule.current_stage:
             raise EditError("cannot record demolition in a past stage")
-        record = BuiltSpan(work_id, start, end, stage, "demolish")
-        self.schedule.add_record(record)
         affected = self._affected_stored_chunks(work)
+        record = BuiltSpan(work_id, start, end, stage, "demolish")
+        before_chunks = {
+            (key.x, key.y): generate_grid(self.parameters, key, self.edits, self.schedule, stage)
+            for key in affected
+        }
+        self.schedule.add_record(record)
         self._refresh_schedule_chunks(affected)
-        return {"record": record, "updated_chunks": affected}
+        earthwork = self._record_stage_earthwork(affected, stage, f"demolish-work-{work_id}", before_chunks)
+        self.save_manifest()
+        return {"record": record, "updated_chunks": affected, "earthwork": earthwork}
 
     def add_temporary_ramp(self, ramp: TemporaryRampOp, stage: int | None = None) -> list[ChunkKey]:
         ramp.validate()
@@ -309,8 +354,16 @@ class TerrainProject:
         self.schedule.junction_stages[junction.id] = stage
         self.schedule.current_stage = max(self.schedule.current_stage, stage)
         affected = self._affected_stored_chunks(junction)
+        before_chunks = {
+            (key.x, key.y): generate_grid(self.parameters, key, self.edits, self.schedule, stage)
+            for key in affected
+        }
         self._refresh_schedule_chunks(affected)
-        return affected
+        earthwork = self._record_stage_earthwork(
+            affected, stage, f"construct-junction-{junction_id}", before_chunks
+        )
+        self.save_manifest()
+        return {"updated_chunks": affected, "earthwork": earthwork}
 
     def advance_stage(self) -> None:
         self._schedule_ready()
@@ -440,6 +493,7 @@ def load_project(root: Path) -> TerrainProject:
     raw_chunks = data.get("chunks", {})
     raw_voided = data.get("voided_edits", [])
     schedule = ConstructionSchedule.from_dict(data.get("construction"))
+    materials = MaterialLedger.from_dict(data.get("materials"))
     try:
         parameters = TerrainParameters.from_mapping(data["parameters"])
     except (ParameterError, KeyError, TypeError) as exc:
@@ -496,4 +550,4 @@ def load_project(root: Path) -> TerrainProject:
             + ", ".join(str(value) for value in missing_junctions)
         )
 
-    return TerrainProject(root, parameters, edits, chunks, raw_voided, schedule)
+    return TerrainProject(root, parameters, edits, chunks, raw_voided, schedule, materials)

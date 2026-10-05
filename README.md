@@ -36,6 +36,12 @@ python -m terrain_system.cli construct-junction ./terrain_demo --junction 4 --st
 python -m terrain_system.cli stage ./terrain_demo --number 1 --chunk 0,0
 python -m terrain_system.cli basis ./terrain_demo --junction 4 --x 0 --y 50
 python -m terrain_system.cli demolish ./terrain_demo --work 2 --start 0 --end 0.25
+python -m terrain_system.cli material ./terrain_demo --action ledger
+python -m terrain_system.cli material ./terrain_demo --action reserve --quantity 100
+python -m terrain_system.cli material ./terrain_demo --action deliver --batch 1 --quantity 80
+python -m terrain_system.cli material ./terrain_demo --action place --batch 1 --event E1 --quantity 80
+python -m terrain_system.cli material ./terrain_demo --action sources --event E1
+python -m terrain_system.cli material ./terrain_demo --action plan-gaps
 python -m terrain_system.cli generate ./terrain_demo 2,0
 python -m terrain_system.cli stitch ./terrain_demo
 python -m terrain_system.cli undo ./terrain_demo --id 2
@@ -54,6 +60,14 @@ preview 不写入工程，返回新线性工程会更新的已生成分块以及
 如果道路完成一半后修改剩余设计，新道路/河道可使用 `road --revises` 引用旧工程 ID。新设计只在自己的施工区间生效，旧设计的已施工区间继续保留；`connect-preview` 给出连接处的世界坐标、当前永久高度、新设计高度和高度差，可据此加入 `ramp` 临时过渡。临时过渡有 `active_from/active_until`，只在这些阶段的 `heights` 中生效，`permanent_heights` 不包含它；阶段结束后自动失效，不进入后续结果。
 
 `undo` 只能撤回尚未形成永久地形的设计修订；已经施工的道路或河道不能通过撤销回退，必须使用 `demolish` 记录一个新的拆除施工决定。junction 也可以用 `construct-junction` 指定生效阶段：跨阶段交汇高度采用该 junction 的显式记录阶段，`basis` 命令返回坐标、阶段、生效工程 ID 和最终采用依据（junction ID 或获胜工程 ID），不依赖生成或编辑顺序。
+
+## 土方材料台账
+
+施工或拆除后，系统对施工前永久面和施工后永久面做网格积分，得到该阶段实际 `cut`（挖方/回收来源）和 `fill`（填方需求）。交汇区只使用最终采用的一个永久面，共享边界点也只进入一次全局网格，因此不会把各工程的名义体积重复累加。临时 ramp 不属于永久土方台账。
+
+材料以批次保存，外部批次先处于 `reserved`（待运输预留），`deliver` 后成为现场空闲量，`place` 后才进入填筑；`cancel` 只能取消尚未运抵的预留，不能回退已经发生的运输或投放。挖方和拆除产生的土方会形成新的 `earthwork` 回收批次，损耗用 `lose` 单独记录。每次投放都记录批次、阶段和挖填事件 ID，重新打开工程后可用 `material --action sources --event E...` 从填筑事件追溯来源。同一批次只能消耗其空闲余额，不能重复使用。
+
+`material --action plan-gaps` 只按阶段比较利用现有堆土/已回收土方与依靠外部补料时的缺口，不会自动创建批次、运输或补平差额。
 
 ## 持久化和非法参数
 

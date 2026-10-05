@@ -18,6 +18,8 @@ from terrain_system.edits import (
 from terrain_system.model import ChunkKey, generate_grid
 from terrain_system.parameters import ParameterError, TerrainParameters
 from terrain_system.project import create_project, load_project
+from terrain_system.materials import MaterialError
+from terrain_system.earthwork import surface_volume_change
 
 
 def _road(work_id: int, height: float = 4.0, revises=None):
@@ -426,3 +428,83 @@ def test_cross_stage_junction_has_explicit_height_basis(tmp_path: Path):
     assert basis["height_basis"] == 3
     assert basis["active_works"] == [1, 2]
     assert basis["permanent_height"] == 5.5
+
+
+def test_earthwork_uses_actual_terrain_change_and_material_batch_is_auditable(tmp_path: Path):
+    project = create_project(tmp_path, params())
+    project.generate_chunks([ChunkKey(0, 0)])
+    project.add_edit(LinearWorkOp(1, "road", -6.0, 0.0, 16.0, 0.0, 2.0, 20.0))
+    first = project.construct_work(1, 0.0, 1.0, stage=1)
+    first_event_id = first["earthwork"]["event"]["id"]
+
+    assert first["earthwork"]["fill"] > 0.0
+    assert first["earthwork"]["cut"] == pytest.approx(0.0, abs=1e-12)
+    recovered = [batch for batch in project.materials.batches if batch.source == "earthwork"]
+    assert recovered == []
+
+    external = project.materials.reserve_external(first["earthwork"]["fill"] + 10.0, 1)
+    project.materials.deliver(external.id, first["earthwork"]["fill"], 1)
+    project.materials.place(external.id, first["earthwork"]["fill"], 1, first_event_id)
+    assert project.materials.fill_sources(first_event_id)["unfilled_trace_gap"] == pytest.approx(0.0)
+
+    with pytest.raises(MaterialError):
+        project.materials.place(external.id, 1.0, 1, first_event_id)
+    project.materials.cancel_reservation(external.id, 10.0, 1)
+    with pytest.raises(MaterialError):
+        project.materials.cancel_reservation(external.id, 1.0, 1)
+    project.save_manifest()
+
+    reloaded = load_project(tmp_path)
+    assert reloaded.materials.fill_sources(first_event_id)["placed"] == pytest.approx(
+        first["earthwork"]["fill"]
+    )
+
+
+def test_intersection_reconstruction_uses_incremental_actual_change_and_demolition_recovers_material(tmp_path: Path):
+    project = create_project(tmp_path, params())
+    project.generate_chunks([ChunkKey(0, 0)])
+    first_work = LinearWorkOp(1, "road", -6.0, 0.0, 16.0, 0.0, 2.0, 4.0)
+    second_work = LinearWorkOp(2, "road", -6.0, 0.0, 16.0, 0.0, 2.0, 5.5, priority=10)
+    project.add_edit(first_work)
+    project.add_edit(second_work)
+
+    first = project.construct_work(1, 0.0, 1.0, stage=1)
+    second = project.construct_work(2, 0.0, 1.0, stage=2)
+    stage_one = project.surface_at_stage(ChunkKey(0, 0), 1)
+    stage_two = project.surface_at_stage(ChunkKey(0, 0), 2)
+    expected_second = surface_volume_change(
+        {(0, 0): stage_one},
+        {(0, 0): stage_two},
+        params().chunk_size / (params().resolution - 1),
+    )
+
+    assert second["earthwork"]["fill"] == pytest.approx(expected_second["fill"])
+    assert second["earthwork"]["fill"] == pytest.approx(18.75)
+    assert second["earthwork"]["fill"] < first["earthwork"]["fill"]
+
+    demolition = project.demolish_work(2, 0.0, 1.0, stage=3)
+    recovered = [batch for batch in project.materials.batches if batch.origin == demolition["earthwork"]["event"]["id"]]
+    assert recovered
+    assert recovered[0].idle == pytest.approx(demolition["earthwork"]["cut"])
+
+
+def test_stage_plan_gaps_are_reported_without_automatic_fill(tmp_path: Path):
+    project = create_project(tmp_path, params())
+    project.generate_chunks([ChunkKey(0, 0)])
+    project.add_edit(LinearWorkOp(1, "road", -6.0, 0.0, 16.0, 0.0, 2.0, 20.0))
+    result = project.construct_work(1, 0.0, 1.0, stage=1)
+    project.materials.register_stockpile(5.0, 1)
+
+    gaps = project.materials.stage_plan_comparison()
+    assert gaps == [{
+        "stage": 1,
+        "events": [result["earthwork"]["event"]["id"]],
+        "cut": 0.0,
+        "fill": result["earthwork"]["fill"],
+        "existing_stockpile_before": 5.0,
+        "recycled_cut": 0.0,
+        "stockpile_plan_gap": result["earthwork"]["fill"] - 5.0,
+        "external_supplement_gap": result["earthwork"]["fill"],
+        "balanced_site_gap": result["earthwork"]["fill"] - 5.0,
+    }]
+    assert all(batch.placed == 0.0 for batch in project.materials.batches)

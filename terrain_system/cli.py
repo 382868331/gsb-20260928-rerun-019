@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .edits import EditError, EditOp, JunctionAdjustmentOp, LinearWorkOp, TemporaryRampOp, next_edit_id
+from .materials import MaterialError
 from .model import ChunkKey
 from .parameters import ParameterError, TerrainParameters
 from .project import ProjectError, create_project, load_project
@@ -173,6 +174,16 @@ def build_parser() -> argparse.ArgumentParser:
     basis.add_argument("--junction", type=int, required=True)
     basis.add_argument("--x", type=float, required=True)
     basis.add_argument("--y", type=float, required=True)
+    material = subparsers.add_parser("material", help="inspect or update the auditable earth-material ledger")
+    material.add_argument("project", type=Path)
+    material.add_argument("--action", choices=(
+        "ledger", "reserve", "deliver", "cancel", "register-stockpile",
+        "lose", "place", "sources", "plan-gaps",
+    ), default="ledger")
+    material.add_argument("--batch", type=int)
+    material.add_argument("--quantity", type=_positive_float)
+    material.add_argument("--stage", type=int)
+    material.add_argument("--event")
     return parser
 
 
@@ -317,6 +328,7 @@ def main(argv: list[str] | None = None) -> int:
             _print_json({
                 "status": "constructed",
                 "record": result["record"].to_dict(),
+                "earthwork": result["earthwork"],
                 "updated_chunks": [[key.x, key.y] for key in result["updated_chunks"]],
             })
         elif args.command == "demolish":
@@ -324,6 +336,7 @@ def main(argv: list[str] | None = None) -> int:
             _print_json({
                 "status": "demolished",
                 "record": result["record"].to_dict(),
+                "earthwork": result["earthwork"],
                 "updated_chunks": [[key.x, key.y] for key in result["updated_chunks"]],
             })
         elif args.command == "ramp":
@@ -348,11 +361,13 @@ def main(argv: list[str] | None = None) -> int:
                 "updated_chunks": [[key.x, key.y] for key in affected],
             })
         elif args.command == "construct-junction":
-            affected = project.construct_junction(args.junction, args.stage)
+            result = project.construct_junction(args.junction, args.stage)
+            affected = result["updated_chunks"]
             _print_json({
                 "status": "junction_constructed",
                 "junction": args.junction,
                 "stage": project.schedule.junction_stages[args.junction],
+                "earthwork": result["earthwork"],
                 "updated_chunks": [[key.x, key.y] for key in affected],
             })
         elif args.command == "stage":
@@ -383,9 +398,57 @@ def main(argv: list[str] | None = None) -> int:
             _print_json({"status": "connection_preview", **project.design_connection_preview(candidate, args.t)})
         elif args.command == "basis":
             _print_json({"status": "basis", **project.junction_height_basis(args.junction, args.x, args.y)})
+        elif args.command == "material":
+            stage = project.schedule.current_stage if args.stage is None else args.stage
+            if stage < 1:
+                raise MaterialError("material stage must be a positive integer")
+            payload: dict
+            if args.action == "ledger":
+                payload = {"status": "material_ledger", **project.materials.to_dict()}
+            elif args.action == "reserve":
+                if args.quantity is None:
+                    raise MaterialError("--quantity is required for this material action")
+                batch = project.materials.reserve_external(args.quantity, stage)
+            elif args.action == "register-stockpile":
+                if args.quantity is None:
+                    raise MaterialError("--quantity is required for this material action")
+                batch = project.materials.register_stockpile(args.quantity, stage)
+            elif args.action in ("deliver", "cancel", "lose", "place"):
+                if args.quantity is None:
+                    raise MaterialError("--quantity is required for this material action")
+                if args.batch is None:
+                    raise MaterialError("--batch is required for this material action")
+                if args.action == "deliver":
+                    batch = project.materials.deliver(args.batch, args.quantity, stage)
+                elif args.action == "cancel":
+                    batch = project.materials.cancel_reservation(args.batch, args.quantity, stage)
+                elif args.action == "lose":
+                    batch = project.materials.record_loss(args.batch, args.quantity, stage)
+                else:
+                    if args.event is None:
+                        raise MaterialError("--event is required when placing material")
+                    batch = project.materials.place(args.batch, args.quantity, stage, args.event)
+            elif args.action == "sources":
+                if args.event is None:
+                    raise MaterialError("--event is required for source tracing")
+                payload = {"status": "fill_sources", **project.materials.fill_sources(args.event)}
+                _print_json(payload)
+                return 0
+            else:
+                payload = {
+                    "status": "plan_gaps",
+                    "stages": project.materials.stage_plan_comparison(),
+                    "note": "gaps are reported only; no fill is automatically created",
+                }
+                _print_json(payload)
+                return 0
+            if args.action != "ledger":
+                project.save_manifest()
+                payload = {"status": args.action, "batch": batch.to_dict()}
+            _print_json(payload)
         else:
             parser.error("unknown command")
-    except (ParameterError, EditError, ProjectError, FileExistsError, FileNotFoundError, ValueError) as exc:
+    except (ParameterError, EditError, MaterialError, ProjectError, FileExistsError, FileNotFoundError, ValueError) as exc:
         print(f"error: {exc}")
         return 1
 
