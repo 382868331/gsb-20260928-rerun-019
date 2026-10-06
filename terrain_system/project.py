@@ -7,6 +7,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from .construction import BuiltSpan, ConstructionSchedule, construction_basis, permanent_height
+from .earthwork import EarthworkLedger, MaterialBatch, scenario_rows
 from .edits import (
     EditOp,
     JunctionAdjustmentOp,
@@ -80,6 +81,7 @@ class TerrainProject:
         chunks: dict[str, str],
         voided_edits: list[dict] | None = None,
         schedule: ConstructionSchedule | None = None,
+        ledger: EarthworkLedger | None = None,
     ):
         self.root = root
         self.parameters = parameters
@@ -87,6 +89,7 @@ class TerrainProject:
         self.chunks = dict(chunks)
         self.voided_edits = list(voided_edits or [])
         self.schedule = schedule or ConstructionSchedule()
+        self.ledger = ledger or EarthworkLedger()
 
     @property
     def chunk_dir(self) -> Path:
@@ -100,6 +103,7 @@ class TerrainProject:
             "chunks": dict(sorted(self.chunks.items())),
             "voided_edits": list(self.voided_edits),
             "construction": self.schedule.to_dict(),
+            "earthwork": self.ledger.to_dict(),
         }
 
     def linear_works(self) -> list[LinearWorkOp]:
@@ -265,11 +269,14 @@ class TerrainProject:
         stage = self.schedule.current_stage if stage is None else stage
         if stage < 1 or stage < self.schedule.current_stage:
             raise EditError("cannot insert a construction stage in the past")
+        cut_before, _ = self.stage_cut_fill(stage)
         record = BuiltSpan(work_id, start, end, stage, "build")
         self.schedule.add_record(record)
+        cut_after, _ = self.stage_cut_fill(stage)
+        batch = self._register_recovered(cut_after - cut_before, "excavation", stage)
         affected = self._affected_stored_chunks(work)
         self._refresh_schedule_chunks(affected)
-        return {"record": record, "updated_chunks": affected}
+        return {"record": record, "updated_chunks": affected, "recovered_batch": batch}
 
     def demolish_work(self, work_id: int, start: float, end: float, stage: int | None = None) -> dict:
         work = self._work(work_id)
@@ -279,11 +286,62 @@ class TerrainProject:
         stage = self.schedule.current_stage + 1 if stage is None else stage
         if stage < self.schedule.current_stage:
             raise EditError("cannot record demolition in a past stage")
+        cut_before, _ = self.stage_cut_fill(stage)
         record = BuiltSpan(work_id, start, end, stage, "demolish")
         self.schedule.add_record(record)
+        cut_after, _ = self.stage_cut_fill(stage)
+        batch = self._register_recovered(cut_after - cut_before, "demolition", stage)
         affected = self._affected_stored_chunks(work)
         self._refresh_schedule_chunks(affected)
-        return {"record": record, "updated_chunks": affected}
+        return {"record": record, "updated_chunks": affected, "recovered_batch": batch}
+
+    def _register_recovered(self, volume: float, source: str, stage: int) -> MaterialBatch | None:
+        if volume <= 1e-9:
+            return None
+        return self.ledger.add_source(source, volume, stage)
+
+    def stage_cut_fill(self, stage: int) -> tuple[float, float]:
+        """Cut/fill of one stage from actual permanent terrain change, junction-safe."""
+        if stage < 1:
+            raise EditError("stage must be a positive integer")
+        cut = 0.0
+        fill = 0.0
+        resolution = self.parameters.resolution
+        for stored_key in sorted(self.chunks):
+            key = ChunkKey.parse(stored_key)
+            before = generate_grid(self.parameters, key, self.edits, self.schedule, stage - 1)
+            after = generate_grid(self.parameters, key, self.edits, self.schedule, stage)
+            area = before["cell_size"] ** 2
+            for row in range(resolution):
+                row_weight = 0.5 if row in (0, resolution - 1) else 1.0
+                for column in range(resolution):
+                    column_weight = 0.5 if column in (0, resolution - 1) else 1.0
+                    delta = after["permanent_heights"][row][column] - before["permanent_heights"][row][column]
+                    volume = delta * area * row_weight * column_weight
+                    if volume > 0.0:
+                        fill += volume
+                    else:
+                        cut -= volume
+        return cut, fill
+
+    def stage_balances(self) -> list[dict]:
+        balances = []
+        for stage in range(1, self.schedule.current_stage + 1):
+            cut, fill = self.stage_cut_fill(stage)
+            balances.append({"stage": stage, "cut": cut, "fill": fill, "net": cut - fill})
+        return balances
+
+    def compare_supply_scenarios(self) -> dict:
+        balances = self.stage_balances()
+        return {
+            "balances": balances,
+            "scenarios": {
+                "reuse_stockpile": scenario_rows(
+                    self.ledger, balances, ("excavation", "demolition", "stockpile")
+                ),
+                "external_only": scenario_rows(self.ledger, balances, ("external",)),
+            },
+        }
 
     def add_temporary_ramp(self, ramp: TemporaryRampOp, stage: int | None = None) -> list[ChunkKey]:
         ramp.validate()
@@ -440,6 +498,7 @@ def load_project(root: Path) -> TerrainProject:
     raw_chunks = data.get("chunks", {})
     raw_voided = data.get("voided_edits", [])
     schedule = ConstructionSchedule.from_dict(data.get("construction"))
+    ledger = EarthworkLedger.from_dict(data.get("earthwork"))
     try:
         parameters = TerrainParameters.from_mapping(data["parameters"])
     except (ParameterError, KeyError, TypeError) as exc:
@@ -496,4 +555,4 @@ def load_project(root: Path) -> TerrainProject:
             + ", ".join(str(value) for value in missing_junctions)
         )
 
-    return TerrainProject(root, parameters, edits, chunks, raw_voided, schedule)
+    return TerrainProject(root, parameters, edits, chunks, raw_voided, schedule, ledger)

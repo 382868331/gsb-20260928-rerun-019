@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .edits import EditError, EditOp, JunctionAdjustmentOp, LinearWorkOp, TemporaryRampOp, next_edit_id
+from .earthwork import LedgerError
 from .model import ChunkKey
 from .parameters import ParameterError, TerrainParameters
 from .project import ProjectError, create_project, load_project
@@ -173,6 +174,48 @@ def build_parser() -> argparse.ArgumentParser:
     basis.add_argument("--junction", type=int, required=True)
     basis.add_argument("--x", type=float, required=True)
     basis.add_argument("--y", type=float, required=True)
+
+    balance = subparsers.add_parser("balance", help="per-stage cut/fill from actual terrain changes")
+    balance.add_argument("project", type=Path)
+
+    ledger = subparsers.add_parser("ledger", help="show material batches, placements and state totals")
+    ledger.add_argument("project", type=Path)
+
+    stockpile = subparsers.add_parser("stockpile", help="register an external or stockpiled material source")
+    stockpile.add_argument("project", type=Path)
+    stockpile.add_argument("--volume", type=_positive_float, required=True)
+    stockpile.add_argument("--stage", type=int, default=0)
+    stockpile.add_argument("--source", choices=("stockpile", "external"), default="stockpile")
+
+    reserve = subparsers.add_parser("reserve", help="reserve an available batch for transport")
+    reserve.add_argument("project", type=Path)
+    reserve.add_argument("--batch", type=int, required=True)
+
+    deliver = subparsers.add_parser("deliver", help="mark a reserved batch as delivered on site")
+    deliver.add_argument("project", type=Path)
+    deliver.add_argument("--batch", type=int, required=True)
+
+    cancel = subparsers.add_parser("cancel", help="cancel a reservation that has not happened yet")
+    cancel.add_argument("project", type=Path)
+    cancel.add_argument("--batch", type=int, required=True)
+
+    loss = subparsers.add_parser("loss", help="record material loss from a batch")
+    loss.add_argument("project", type=Path)
+    loss.add_argument("--batch", type=int, required=True)
+    loss.add_argument("--volume", type=_positive_float, required=True)
+
+    place = subparsers.add_parser("place", help="place delivered material into a stage fill")
+    place.add_argument("project", type=Path)
+    place.add_argument("--stage", type=int, required=True)
+    place.add_argument("--volume", type=_positive_float, required=True)
+    place.add_argument("--batch", type=int, nargs="*")
+
+    trace = subparsers.add_parser("trace", help="trace a fill placement back to its source batches")
+    trace.add_argument("project", type=Path)
+    trace.add_argument("--placement", type=int, required=True)
+
+    compare = subparsers.add_parser("compare", help="compare per-stage gaps of reuse vs external supply scenarios")
+    compare.add_argument("project", type=Path)
     return parser
 
 
@@ -318,6 +361,7 @@ def main(argv: list[str] | None = None) -> int:
                 "status": "constructed",
                 "record": result["record"].to_dict(),
                 "updated_chunks": [[key.x, key.y] for key in result["updated_chunks"]],
+                "recovered_batch": result["recovered_batch"].to_dict() if result["recovered_batch"] else None,
             })
         elif args.command == "demolish":
             result = project.demolish_work(args.work, args.start, args.end, args.stage)
@@ -325,6 +369,7 @@ def main(argv: list[str] | None = None) -> int:
                 "status": "demolished",
                 "record": result["record"].to_dict(),
                 "updated_chunks": [[key.x, key.y] for key in result["updated_chunks"]],
+                "recovered_batch": result["recovered_batch"].to_dict() if result["recovered_batch"] else None,
             })
         elif args.command == "ramp":
             edit = TemporaryRampOp(
@@ -383,9 +428,45 @@ def main(argv: list[str] | None = None) -> int:
             _print_json({"status": "connection_preview", **project.design_connection_preview(candidate, args.t)})
         elif args.command == "basis":
             _print_json({"status": "basis", **project.junction_height_basis(args.junction, args.x, args.y)})
+        elif args.command == "balance":
+            _print_json({"status": "balance", "balances": project.stage_balances()})
+        elif args.command == "ledger":
+            _print_json({
+                "status": "ledger",
+                "state_totals": project.ledger.state_totals(),
+                **project.ledger.to_dict(),
+            })
+        elif args.command == "stockpile":
+            batch = project.ledger.add_source(args.source, args.volume, args.stage)
+            project.save_manifest()
+            _print_json({"status": "source_added", "batch": batch.to_dict()})
+        elif args.command == "reserve":
+            batch = project.ledger.reserve(args.batch)
+            project.save_manifest()
+            _print_json({"status": "reserved", "batch": batch.to_dict()})
+        elif args.command == "deliver":
+            batch = project.ledger.deliver(args.batch)
+            project.save_manifest()
+            _print_json({"status": "delivered", "batch": batch.to_dict()})
+        elif args.command == "cancel":
+            batch = project.ledger.cancel(args.batch)
+            project.save_manifest()
+            _print_json({"status": "cancelled", "batch": batch.to_dict()})
+        elif args.command == "loss":
+            batch = project.ledger.record_loss(args.batch, args.volume)
+            project.save_manifest()
+            _print_json({"status": "loss_recorded", "batch": batch.to_dict()})
+        elif args.command == "place":
+            placement = project.ledger.place(args.stage, args.volume, args.batch or None)
+            project.save_manifest()
+            _print_json({"status": "placed", "placement": placement.to_dict()})
+        elif args.command == "trace":
+            _print_json({"status": "trace", **project.ledger.trace(args.placement)})
+        elif args.command == "compare":
+            _print_json({"status": "compare", **project.compare_supply_scenarios()})
         else:
             parser.error("unknown command")
-    except (ParameterError, EditError, ProjectError, FileExistsError, FileNotFoundError, ValueError) as exc:
+    except (ParameterError, EditError, ProjectError, LedgerError, FileExistsError, FileNotFoundError, ValueError) as exc:
         print(f"error: {exc}")
         return 1
 

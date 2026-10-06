@@ -55,6 +55,27 @@ preview 不写入工程，返回新线性工程会更新的已生成分块以及
 
 `undo` 只能撤回尚未形成永久地形的设计修订；已经施工的道路或河道不能通过撤销回退，必须使用 `demolish` 记录一个新的拆除施工决定。junction 也可以用 `construct-junction` 指定生效阶段：跨阶段交汇高度采用该 junction 的显式记录阶段，`basis` 命令返回坐标、阶段、生效工程 ID 和最终采用依据（junction ID 或获胜工程 ID），不依赖生成或编辑顺序。
 
+## 土方材料台账
+
+施工产生的挖填量不按各工程名义几何重复累加，而是由 `balance` 按相邻阶段永久地形的实际高差逐格积分（边界点半权重，跨块不重复计），因此交汇区只按最终地形计一次。`construct` 记录的实际挖方自动登记为 excavation 批次，`demolish` 的拆除量登记为 demolition 回收批次，二者与 `stockpile` 登记的外部/堆土批次一起进入台账，保存于 project.json 的 `earthwork` 节。
+
+批次状态机：available（空闲）→ reserved（待运输预留）→ delivered（已运抵）→ placed（已投放），另有 lost（损耗）。`cancel` 只释放尚未发生的预留（reserved → available），已运抵或已投放的批次不能取消；`loss` 从批次余量中扣减损耗；`place` 只从已运抵批次按 ID 顺序扣减，同一批材料余量归零后不可再次使用，投放记录保存每笔分配的批次与方量，重开工程后可用 `trace` 从填筑记录追溯来源批次。供应量不足时 `place` 报错并给出缺口，不自动补平差额。
+
+`compare` 对比两种供料方案的逐阶段缺口：reuse_stockpile（开挖+拆除回收+堆土）与 external_only（仅外部补料）。每阶段输出未满足填筑需求、当期新增供给、累计供需与缺口，只报告不平衡，不修改台账。
+
+~~~bash
+python -m terrain_system.cli balance ./terrain_demo
+python -m terrain_system.cli stockpile ./terrain_demo --volume 500 --stage 1 --source stockpile
+python -m terrain_system.cli reserve ./terrain_demo --batch 1
+python -m terrain_system.cli deliver ./terrain_demo --batch 1
+python -m terrain_system.cli place ./terrain_demo --stage 1 --volume 200
+python -m terrain_system.cli trace ./terrain_demo --placement 1
+python -m terrain_system.cli loss ./terrain_demo --batch 1 --volume 10
+python -m terrain_system.cli cancel ./terrain_demo --batch 2
+python -m terrain_system.cli ledger ./terrain_demo
+python -m terrain_system.cli compare ./terrain_demo
+~~~
+
 ## 持久化和非法参数
 
 所有 JSON 都通过临时文件加原子替换写入。初始化时会先完整校验参数，参数非法不会覆盖旧工程。编辑操作使用唯一正数 ID，撤回可在序列中留下空隙；重新打开工程后仍按 ID 从小到大固定重放。
